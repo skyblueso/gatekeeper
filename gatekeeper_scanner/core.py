@@ -2347,8 +2347,8 @@ class SecurityScanner:
 
     def _classify_file_context(self, f):
         """Classify file by path context: test, example, docs, vendor, devtool, etc."""
-        fl = f.file.lower()
-        _parts = fl.replace("\\", "/").split("/")
+        fl = f.file.lower().replace("\\", "/")
+        _parts = fl.split("/")
         _dirs = set(_parts[:-1]) if len(_parts) > 1 else set()
         _fname = _parts[-1] if _parts else ""
 
