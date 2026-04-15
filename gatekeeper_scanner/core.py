@@ -2884,6 +2884,14 @@ def _evaluate_policy(findings: List[Finding], policy_str: str) -> bool:
 
 
 def main():
+    # Ensure UTF-8 output on Windows (cp1252 can't render Unicode box-drawing/block chars)
+    if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass  # Python 3.6 or non-reconfigurable stream
+
     parser = argparse.ArgumentParser(
         description="Gatekeeper Security Scanner v1.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
