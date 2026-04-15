@@ -57,11 +57,15 @@ class ReportPrinter:
         C = f"{self.BOLD}{self.CYAN}"
         R = self.RESET
         D = self.DIM
-        print(f"  {C}\u2554\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2557{R}")
-        print(f"  {C}\u2551   \u2551   \u2551   \u2551      G A T E K E E P E R   \u2551   \u2551   \u2551   \u2551{R}")
-        print(f"  {C}\u2568   \u2568   \u2568   \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d   \u2568   \u2568   \u2568{R}")
-        print(f"  {D}v{self._version} By @simchabrodsky \u2014 Exposes what other scanners can't see.{R}")
-        print(f"  {D}The brutally honest repo, skill & agent scanner.{R}")
+        try:
+            print(f"  {C}\u2554\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2566\u2550\u2550\u2550\u2557{R}")
+            print(f"  {C}\u2551   \u2551   \u2551   \u2551      G A T E K E E P E R   \u2551   \u2551   \u2551   \u2551{R}")
+            print(f"  {C}\u2568   \u2568   \u2568   \u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d   \u2568   \u2568   \u2568{R}")
+            print(f"  {D}v{self._version} By @simchabrodsky \u2014 Exposes what other scanners can't see.{R}")
+            print(f"  {D}The brutally honest repo, skill & agent scanner.{R}")
+        except UnicodeEncodeError:
+            print(f"  {C}G A T E K E E P E R{R}")
+            print(f"  {D}v{self._version} By @simchabrodsky{R}")
 
     def print_warnings(self, warnings: List[str]):
         if not warnings:
