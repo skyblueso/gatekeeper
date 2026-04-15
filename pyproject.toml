@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gatekeeper-scanner"
+version = "1.0.0"
+description = "Security scanner for GitHub repos, MCP servers, AI agent packages, and local projects"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{name = "Simcha Brodsky", email = "simcha@osint613.com"}]
+readme = "README.md"
+keywords = ["security", "scanner", "mcp", "ai-agent", "code-audit", "vulnerability"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/brodskysimcha-netizen/gatekeeper"
+Repository = "https://github.com/brodskysimcha-netizen/gatekeeper"
+Issues = "https://github.com/brodskysimcha-netizen/gatekeeper/issues"
+Changelog = "https://github.com/brodskysimcha-netizen/gatekeeper/blob/main/CHANGELOG.md"
+
+[project.scripts]
+gatekeeper = "gatekeeper_scanner.core:main"
+
+[project.optional-dependencies]
+dev = ["pip-audit"]
+
+[tool.setuptools]
+packages = ["gatekeeper_scanner"]
