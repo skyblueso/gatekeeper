@@ -2,7 +2,7 @@
 
 **Security scanner for GitHub repos, MCP servers, AI agent packages, and local projects.**
 
-Built by [Simcha Brodsky](https://github.com/brodskysimcha-netizen) ([@simchabrodsky](https://x.com/simchabrodsky))
+Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https://x.com/simchabrodsky))
 
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-297%20passing-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -22,7 +22,7 @@ Gatekeeper covers the AI-specific attack surface that no commercial scanner touc
 
 ```bash
 # Clone
-git clone https://github.com/brodskysimcha-netizen/gatekeeper
+git clone https://github.com/skyblueso/gatekeeper
 cd gatekeeper
 
 # Scan a GitHub repo before installing it
@@ -344,7 +344,7 @@ jobs:
 
       - name: Clone Gatekeeper
         run: |
-          git clone https://github.com/brodskysimcha-netizen/gatekeeper /tmp/gatekeeper
+          git clone https://github.com/skyblueso/gatekeeper /tmp/gatekeeper
           cd /tmp/gatekeeper && git checkout v1.2.0  # Pin to a release tag
 
       - name: Run Gatekeeper

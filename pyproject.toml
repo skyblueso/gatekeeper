@@ -26,10 +26,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/brodskysimcha-netizen/gatekeeper"
-Repository = "https://github.com/brodskysimcha-netizen/gatekeeper"
-Issues = "https://github.com/brodskysimcha-netizen/gatekeeper/issues"
-Changelog = "https://github.com/brodskysimcha-netizen/gatekeeper/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/skyblueso/gatekeeper"
+Repository = "https://github.com/skyblueso/gatekeeper"
+Issues = "https://github.com/skyblueso/gatekeeper/issues"
+Changelog = "https://github.com/skyblueso/gatekeeper/blob/main/CHANGELOG.md"
 
 [project.scripts]
 gatekeeper = "gatekeeper_scanner.core:main"

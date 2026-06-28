@@ -8,7 +8,7 @@ If you discover a security vulnerability in Gatekeeper, please report it respons
 
 ### How to Report
 
-1. **GitHub Security Advisories** (preferred): Use [GitHub's private vulnerability reporting](https://github.com/brodskysimcha-netizen/gatekeeper/security/advisories/new)
+1. **GitHub Security Advisories** (preferred): Use [GitHub's private vulnerability reporting](https://github.com/skyblueso/gatekeeper/security/advisories/new)
 2. **Email**: Contact simcha@osint613.com with subject line "Gatekeeper Security Report"
 
 ### What to Include

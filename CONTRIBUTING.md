@@ -8,7 +8,7 @@ Contributions are welcome: new detection patterns, language coverage, bug fixes,
 # Fork the repo on GitHub, then:
 git clone https://github.com/YOUR-USERNAME/gatekeeper
 cd gatekeeper
-git remote add upstream https://github.com/brodskysimcha-netizen/gatekeeper
+git remote add upstream https://github.com/skyblueso/gatekeeper
 git checkout -b your-feature-branch
 python3 -m unittest test_gatekeeper -v  # Run tests, all must pass
 python3 gatekeeper.py --self-scan        # Must still grade A
