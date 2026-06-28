@@ -1,6 +1,8 @@
 # Gatekeeper
 
-**Security scanner for GitHub repos, MCP servers, AI agent packages, and local projects.**
+![Gatekeeper](banner.png)
+
+**Security analysis for GitHub repos, MCP servers, and AI agent packages. One scan, before you install.**
 
 Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https://x.com/simchabrodsky))
 
@@ -8,13 +10,17 @@ Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https:
 
 ---
 
-## What It Does
+## What it does
 
-The problem Gatekeeper exists to solve is specific: AI agents, MCP servers, and GitHub repos are proliferating at an unprecedented pace, and people are installing them without any practical way to check if they're safe first. Gatekeeper aims to make that whole process just a bit safer. Keeping you covered while you build up your skill and agent database.
+Be honest. When was the last time you actually read the code of an MCP server before wiring it into your agent? Or audited that handy GitHub repo before pasting its install command into your terminal? Almost nobody does. We clone, we install, we paste the setup line, and we hope.
 
-The existing scanners: Semgrep, CodeQL, Snyk, all are excellent at what they do. But none of them answer the basic question: "Should I install or use this repo? Is it dangerous? Malicious? Does it open my system to vulnerabilities?" Gatekeeper is the first to do that.
+That habit is the entire attack surface of modern AI tooling, and it is wide open. A poisoned CLAUDE.md that quietly redirects your assistant. A tool description with a hidden prompt injection. A dependency that exists for no reason except to run a malicious install hook. None of it looks dangerous until it is.
 
-Gatekeeper covers the AI-specific attack surface that no commercial scanner touches: CLAUDE.md poisoning, MCP schema poisoning, prompt injection embedded in tool descriptions, phantom dependencies that exist only for their install hooks, string concatenation evasion designed to defeat regex scanners, and GitHub Actions injection via untrusted event inputs. On top of pattern and AST detection, it runs YARA signatures for known-bad payloads (webshells, miners, droppers) and intra-function taint tracking that follows untrusted input to a dangerous sink. Its one skill, one scan, and will cover just about everything needed, with zero technical setup.
+Gatekeeper is the two-minute check you run first. Point it at a repo, an MCP server, an agent package, or a local folder, and it answers one question in plain language: is this safe to install, or not? You get a letter grade, the specific findings behind it, and enough context to make the call.
+
+Semgrep, CodeQL, and Snyk are excellent, but they answer "where are the bugs in my own code?" Gatekeeper answers a different question: "is this stranger's code safe to let into my system?" It is built for the AI-tooling attack surface those traditional scanners were never designed to see.
+
+Under the hood: pattern and AST detection across 16 languages, intra-function taint tracking that follows untrusted input to a dangerous sink, YARA signatures for known-bad payloads like webshells and miners, dependency CVE checks, and the AI-specific surface nobody else covers (CLAUDE.md poisoning, MCP schema poisoning, prompt injection in tool descriptions, phantom dependencies, evasion tricks built to beat regex scanners). One command, zero setup, a clear verdict at the end.
 
 ---
 
