@@ -310,11 +310,25 @@ class TestSecretDetection(unittest.TestCase):
             "sk-ant-" + "a1b2c3d4" * 6
         ))
 
+    def test_anthropic_key_with_underscore(self):
+        # Real Anthropic keys are sk-ant-api03- followed by URL-safe base64,
+        # which includes underscores. The pattern must include '_' or it misses
+        # keys where an underscore falls within the first 40 chars. Assembled
+        # from parts so this file contains no contiguous key-shaped string.
+        key = "sk-ant-" + "api03-" + "Ab_Cd-Ef" + "g" * 40 + "_xYZ" + "AA"
+        self.assertTrue(self._secret_matches("Anthropic API Key", key))
+
     def test_openai_key(self):
         self.assertTrue(self._secret_matches(
             "OpenAI API Key",
             "sk-" + "A" * 48
         ))
+
+    def test_openai_project_key(self):
+        # Modern OpenAI keys (sk-proj-, sk-svcacct-, sk-admin-) contain hyphens
+        # and underscores, which the legacy alphanumeric-only pattern misses.
+        key = "sk-proj-" + "Ab12_Cd-34" + "Z" * 90 + "T3BlbkFJ" + "q" * 20
+        self.assertTrue(self._secret_matches("OpenAI API Key", key))
 
     def test_slack_token(self):
         self.assertTrue(self._secret_matches(
