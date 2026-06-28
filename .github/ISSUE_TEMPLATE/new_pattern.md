@@ -21,4 +21,4 @@ about: Suggest a new security pattern to detect
 
 **Severity:** CRITICAL / HIGH / MEDIUM / LOW
 
-**CWE:** (if known — e.g., CWE-78 for command injection)
+**CWE:** (if known: e.g., CWE-78 for command injection)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper Security Scanner v1.0
+Gatekeeper Security Scanner v1.2.0
 
 Full-stack security analysis for GitHub repos, MCP servers, AI agent packages,
 and local projects. One command. Every check. Every time.
@@ -15,6 +15,7 @@ Architecture: Detect → Verify → Score
 import argparse
 import fnmatch
 import hashlib
+import importlib.util
 import json
 import logging
 import math
@@ -60,7 +61,7 @@ from gatekeeper_scanner.reporter import ReportPrinter, generate_sarif  # noqa: F
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
@@ -176,10 +177,13 @@ PRIVATE_IP = re.compile(
 # ============================================================================
 
 class SecurityScanner:
-    def __init__(self, skip_deps=False, max_files=MAX_TOTAL_FILES, exclude_patterns=None, config=None, trust_target=False, git_env=None, verbose=False):
+    def __init__(self, skip_deps=False, max_files=MAX_TOTAL_FILES, exclude_patterns=None, config=None, trust_target=False, git_env=None, verbose=False, no_osv=False, no_taint=False, no_yara=False):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.config["severity_weights"] = dict(self.config["severity_weights"])
         self.skip_deps = skip_deps
+        self.no_osv = no_osv
+        self.no_taint = no_taint
+        self.no_yara = no_yara
         self.verbose = verbose
         self.max_files = self.config.get("max_files", max_files)
         self.exclude_patterns = exclude_patterns or self.config.get("exclude", [])
@@ -320,6 +324,7 @@ class SecurityScanner:
             # Phase 2: Run ALL detection modules (raw findings)
             self._scan_code_patterns(cats)
             self._scan_ast(cats)
+            self._scan_taint(cats)
             self._scan_multiline_patterns(cats)
             self._detect_secrets(cats, scan_path)
             self._analyze_network(cats, scan_path)
@@ -331,6 +336,7 @@ class SecurityScanner:
             self._scan_makefiles(cats)
             self._scan_setup_files(cats)
             self._detect_binaries(cats)
+            self._scan_yara(cats)
             self._detect_symlinks(cats)
             self._detect_obfuscation(cats)
             self._detect_aliased_imports(cats)
@@ -2092,6 +2098,8 @@ class SecurityScanner:
             return
         pip_audit_bin = self._resolve_binary("pip-audit")
         if not pip_audit_bin:
+            if self._osv_python(path, report):
+                return
             self._add_warning("pip-audit not installed — CVE scanning skipped. Install with: pip install pip-audit")
             return
         try:
@@ -2124,6 +2132,8 @@ class SecurityScanner:
             return
         npm_bin = self._resolve_binary("npm")
         if not npm_bin:
+            if self._osv_npm(path, report):
+                return
             self._add_warning("npm not found — CVE scanning skipped")
             return
         try:
@@ -2139,9 +2149,186 @@ class SecurityScanner:
                             message=f"npm audit: {name} — {info.get('title', sev)}",
                         ))
         except FileNotFoundError:
+            if self._osv_npm(path, report):
+                return
             self._add_warning("WARNING: npm not available — CVE scanning skipped. Install Node.js")
         except (subprocess.TimeoutExpired, json.JSONDecodeError):
             pass
+
+    # ------------------------------------------------------------------
+    # Intra-function taint analysis (Python)
+    # ------------------------------------------------------------------
+
+    def _scan_taint(self, cats: CategorizedFiles):
+        """Follow untrusted input from source to dangerous sink within a single
+        Python function. Catches data-flow risks regex/AST cannot see."""
+        if self.no_taint:
+            return
+        try:
+            from gatekeeper_scanner import taint
+        except ImportError:
+            return
+        for fpath, rel_path, ext in cats.source_files:
+            if ext != ".py":
+                continue
+            content = self._read_file(fpath)
+            if content is None:
+                continue
+            for t in taint.analyze(rel_path, content):
+                self._add_finding(Finding(
+                    severity=t["severity"], category="TAINT",
+                    file=rel_path, line=t["line"], message=t["message"],
+                    snippet="", cwe=t["cwe"],
+                ))
+
+    # ------------------------------------------------------------------
+    # YARA signature engine (optional — requires yara-python)
+    # ------------------------------------------------------------------
+
+    def _scan_yara(self, cats: CategorizedFiles):
+        """Match authored YARA signatures over text + binary files. Catches
+        known-bad content (webshells, reverse shells, miners, droppers) that
+        pattern/AST matching misses. Optional: skipped if yara-python absent."""
+        if self.no_yara:
+            return
+        try:
+            from gatekeeper_scanner import yara_engine
+        except ImportError:
+            return
+        if not yara_engine.available():
+            self._add_warning(
+                "YARA signature scan skipped — yara-python not installed "
+                "(pip install yara-python enables webshell/miner/dropper signatures).")
+            return
+        rules, err = yara_engine.compile_rules()
+        if rules is None:
+            if err:
+                self._add_warning(f"YARA signature scan skipped — {err}")
+            return
+
+        seen_paths = set()
+        targets = []
+        for fp, rp, _ext in cats.all_text_files:
+            if fp not in seen_paths:
+                seen_paths.add(fp)
+                targets.append((fp, rp))
+        for fp, rp in cats.binary_files:
+            if fp not in seen_paths:
+                seen_paths.add(fp)
+                targets.append((fp, rp))
+
+        valid_sev = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
+        for fp, rp in targets:
+            # Signature/rule files self-match by design — never scan them.
+            if rp.lower().endswith((".yar", ".yara", ".sigma")):
+                continue
+            try:
+                with open(fp, "rb") as fh:
+                    data = fh.read(yara_engine.MAX_SCAN_BYTES)
+            except (OSError, IOError):
+                continue
+            for m in yara_engine.scan_bytes(rules, data):
+                sev = m["severity"] if m["severity"] in valid_sev else "HIGH"
+                self._add_finding(Finding(
+                    severity=sev, category="SIGNATURE", file=rp, line=0,
+                    message=f"YARA signature: {m['description']} [{m['rule']}]",
+                    snippet="", cwe="CWE-506",
+                ))
+
+    # ------------------------------------------------------------------
+    # OSV.dev fallback — network CVE lookups when audit binaries are absent
+    # ------------------------------------------------------------------
+
+    def _osv_enabled(self) -> bool:
+        """OSV is a network fallback; disabled by --no-osv and by offline mode."""
+        return not self.no_osv and not self.skip_deps
+
+    def _emit_osv_findings(self, results, file_label: str, report: Dict) -> bool:
+        """Turn osv.audit_packages results into Findings. Returns True if OSV
+        ran (regardless of whether vulns were found), so callers can suppress
+        the 'binary not installed' warning."""
+        for r in results:
+            ident = r["cve"] or r["id"]
+            desc = r["summary"] or "no description"
+            report["audit_findings"].append({
+                "package": r["package"], "severity": r["severity"].lower(),
+                "description": f"{ident}: {desc}",
+            })
+            self._add_finding(Finding(
+                severity=r["severity"], category="DEPENDENCY",
+                file=file_label, line=0,
+                message=f"CVE in {r['package']} {r['version']}: {ident} — {desc[:100]} (via OSV.dev)",
+            ))
+        return True
+
+    def _osv_python(self, path: str, report: Dict) -> bool:
+        if not self._osv_enabled():
+            return False
+        req = os.path.join(path, "requirements.txt")
+        if not os.path.exists(req):
+            return False
+        packages = []
+        try:
+            with open(req, "r") as f:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    if not line or line.startswith("-"):
+                        continue
+                    m = re.match(r"^([A-Za-z0-9._-]+)\s*==\s*([A-Za-z0-9._+!-]+)", line)
+                    if m:
+                        packages.append({"name": m.group(1), "version": m.group(2)})
+        except (OSError, IOError):
+            return False
+        if not packages:
+            return False
+        try:
+            from gatekeeper_scanner.osv import audit_packages
+        except ImportError:
+            return False
+        results, warning = audit_packages(packages, "PyPI")
+        if warning:
+            self._add_warning(warning)
+            return False
+        self._add_warning("pip-audit not installed — used OSV.dev for CVE lookup (pinned packages only)")
+        return self._emit_osv_findings(results, "requirements.txt", report)
+
+    def _osv_npm(self, path: str, report: Dict) -> bool:
+        if not self._osv_enabled():
+            return False
+        lock = os.path.join(path, "package-lock.json")
+        if not os.path.exists(lock):
+            return False
+        packages = []
+        try:
+            with open(lock, "r") as f:
+                data = json.load(f)
+        except (OSError, IOError, json.JSONDecodeError):
+            return False
+        # lockfileVersion 2/3: "packages" keyed by "node_modules/<name>"
+        for key, meta in (data.get("packages") or {}).items():
+            if not key or not isinstance(meta, dict):
+                continue
+            name = key.split("node_modules/")[-1]
+            ver = meta.get("version")
+            if name and ver:
+                packages.append({"name": name, "version": ver})
+        # lockfileVersion 1: "dependencies" keyed by name
+        if not packages:
+            for name, meta in (data.get("dependencies") or {}).items():
+                if isinstance(meta, dict) and meta.get("version"):
+                    packages.append({"name": name, "version": meta["version"]})
+        if not packages:
+            return False
+        try:
+            from gatekeeper_scanner.osv import audit_packages
+        except ImportError:
+            return False
+        results, warning = audit_packages(packages, "npm")
+        if warning:
+            self._add_warning(warning)
+            return False
+        self._add_warning("npm not available — used OSV.dev for CVE lookup")
+        return self._emit_osv_findings(results, "package.json", report)
 
     # ------------------------------------------------------------------
     # License checking
@@ -2253,7 +2440,19 @@ class SecurityScanner:
 
     def _verify_scanner_self_detection(self, f):
         """Suppress findings in scanner source files (rule definitions, not vulnerabilities)."""
-        if f.file.endswith(("gatekeeper.py", "scanner.py", "rules.py", "patterns.py", "ast_scanner.py", "reporter.py", "core.py", "models.py")):
+        if f.file.endswith(("gatekeeper.py", "scanner.py", "rules.py", "patterns.py", "ast_scanner.py", "reporter.py", "core.py", "models.py", "yara_engine.py", "taint.py", "osv.py")):
+            if f.category == "SIGNATURE":
+                self._dismiss(f, "pattern_definition", "Signature string in scanner's own rule/pattern definitions, not a real payload")
+                return
+            # Detector logic: a dangerous-API name appearing INSIDE a string
+            # literal (sink label or name comparison, e.g. "yaml.load()",
+            # chain == "__import__") is a definition, not a call. Real calls have
+            # no leading quote before the token, so they are not dismissed here.
+            if f.snippet and re.search(
+                    r"""['"][^'"]*(?:eval|exec|__import__|yaml\.load|pickle|marshal|subprocess|os\.system|os\.popen|compile|importlib|import_module)\b""",
+                    f.snippet):
+                self._dismiss(f, "detector_logic", "Dangerous API name inside a string literal in scanner detector code, not a call")
+                return
             if f.snippet and re.search(r'"(?:EXECUTION|INJECTION|FILESYSTEM|NETWORK|PERMISSION|OBFUSCATION|SECRET|MCP|DEPENDENCY|LICENSE)"', f.snippet):
                 self._dismiss(f, "pattern_definition", "Rule definition line, not actual vulnerability")
                 return
@@ -2883,6 +3082,93 @@ def _evaluate_policy(findings: List[Finding], policy_str: str) -> bool:
     return True
 
 
+# Optional add-ons that unlock extra checks. Gatekeeper runs fully without them.
+# import: the importable module name. pkg: the pip package to install.
+OPTIONAL_DEPS = [
+    {
+        "pkg": "yara-python",
+        "import": "yara",
+        "reason": "signature scanning that catches known webshells, crypto miners, "
+                  "reverse shells, and malware droppers by their fingerprint",
+    },
+]
+
+
+def _missing_optional_deps():
+    """Return the OPTIONAL_DEPS entries whose module is not importable."""
+    return [d for d in OPTIONAL_DEPS if importlib.util.find_spec(d["import"]) is None]
+
+
+def _prompt_optional_deps(args):
+    """First-run, terminal-only offer to install optional add-ons.
+
+    Stays silent unless a human is at a real TTY and output is human-facing
+    (not --json/--sarif/--quiet). Never blocks piped/automated runs. Asks once
+    per package: the choice is remembered in ~/.gatekeeper/deps-prompted.json,
+    so a newly added optional dep prompts once and prior answers are kept."""
+    if args.json or args.sarif or args.quiet:
+        return
+    if os.environ.get("GATEKEEPER_NO_PROMPT"):
+        return
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return
+    except (ValueError, AttributeError):
+        return
+
+    missing = _missing_optional_deps()
+    if not missing:
+        return
+
+    marker_dir = os.path.expanduser("~/.gatekeeper")
+    marker = os.path.join(marker_dir, "deps-prompted.json")
+    prompted = set()
+    try:
+        with open(marker) as f:
+            prompted = set(json.load(f))
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+    fresh = [d for d in missing if d["pkg"] not in prompted]
+    if not fresh:
+        return
+
+    print()
+    if len(fresh) == 1:
+        d = fresh[0]
+        print("  Gatekeeper works with zero dependencies. There is one optional add-on we recommend:")
+        print(f"    {d['pkg']} — {d['reason']}.")
+        print("  Without it, every other check still runs.")
+    else:
+        print("  Gatekeeper works with zero dependencies. A few optional add-ons would extend it:")
+        for d in fresh:
+            print(f"    {d['pkg']} — {d['reason']}.")
+        print("  Without them, every other check still runs.")
+
+    pkgs = [d["pkg"] for d in fresh]
+    try:
+        answer = input("  Install now with pip? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+
+    if answer in ("y", "yes"):
+        print(f"  Installing: {' '.join(pkgs)} ...")
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", *pkgs], check=False)
+        except Exception as e:
+            print(f"  Install did not complete ({e}). Install manually: pip install {' '.join(pkgs)}")
+    else:
+        print(f"  Skipped. Install anytime: pip install {' '.join(pkgs)}")
+
+    try:
+        os.makedirs(marker_dir, exist_ok=True)
+        with open(marker, "w") as f:
+            json.dump(sorted(prompted | set(pkgs)), f)
+    except OSError:
+        pass
+    print()
+
+
 def main():
     # Ensure UTF-8 output on Windows (cp1252 can't render Unicode box-drawing/block chars)
     if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
@@ -2893,7 +3179,7 @@ def main():
             pass  # Python 3.6 or non-reconfigurable stream
 
     parser = argparse.ArgumentParser(
-        description="Gatekeeper Security Scanner v1.0",
+        description="Gatekeeper Security Scanner v1.2.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python3 gatekeeper.py https://github.com/user/repo\n"
@@ -2905,6 +3191,9 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output JSON report")
     parser.add_argument("--sarif", action="store_true", help="Output SARIF v2.1.0 for CI/CD integration")
     parser.add_argument("--skip-deps", action="store_true", help="Skip dependency audit (offline mode)")
+    parser.add_argument("--no-osv", action="store_true", help="Disable OSV.dev network fallback for CVE lookups")
+    parser.add_argument("--no-taint", action="store_true", help="Disable intra-function taint analysis (Python)")
+    parser.add_argument("--no-yara", action="store_true", help="Disable YARA signature scanning")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     parser.add_argument("--max-files", type=int, default=MAX_TOTAL_FILES, help=f"Maximum files to scan (default: {MAX_TOTAL_FILES})")
     parser.add_argument("--exclude", type=str, default="", help="Comma-separated glob patterns to exclude (e.g. 'vendor/**,*.min.js')")
@@ -2947,6 +3236,9 @@ def main():
             "GIT_CONFIG_VALUE_0": "https://github.com/",
         }
 
+    # First-run, terminal-only offer to install optional add-ons (e.g. yara-python).
+    _prompt_optional_deps(args)
+
     if not args.json and not args.sarif and not args.quiet:
         print(f"\n  Scanning: {args.target}...")
         print()
@@ -2967,7 +3259,7 @@ def main():
             pass  # Windows: timer started below after scanner creation
 
     disabled_rules = set(r.strip() for r in args.disable_rules.split(",") if r.strip()) if args.disable_rules else set()
-    scanner = SecurityScanner(skip_deps=args.skip_deps, max_files=args.max_files, exclude_patterns=exclude_patterns, trust_target=args.trust, git_env=git_env, verbose=args.verbose)
+    scanner = SecurityScanner(skip_deps=args.skip_deps, max_files=args.max_files, exclude_patterns=exclude_patterns, trust_target=args.trust, git_env=git_env, verbose=args.verbose, no_osv=args.no_osv, no_taint=args.no_taint, no_yara=args.no_yara)
 
     # Windows timeout fallback — started after scanner creation so cleanup can access temp_dirs
     if args.timeout > 0 and not _use_signal_timeout:

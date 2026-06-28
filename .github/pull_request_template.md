@@ -8,6 +8,6 @@
 
 ## Test results
 
-- [ ] `python3 -m unittest test_gatekeeper -v` — all tests pass
-- [ ] `python3 gatekeeper.py --self-scan` — still grades A
+- [ ] `python3 -m unittest test_gatekeeper -v`: all tests pass
+- [ ] `python3 gatekeeper.py --self-scan`: still grades A
 - [ ] Added tests for new patterns/features (if applicable)

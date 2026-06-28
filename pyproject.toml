@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gatekeeper-scanner"
-version = "1.0.0"
+version = "1.2.0"
 description = "Security scanner for GitHub repos, MCP servers, AI agent packages, and local projects"
 requires-python = ">=3.9"
 license = "MIT"
@@ -36,6 +36,10 @@ gatekeeper = "gatekeeper_scanner.core:main"
 
 [project.optional-dependencies]
 dev = ["pip-audit"]
+# Optional engine: enables YARA signature scanning (webshells, miners,
+# reverse shells, droppers). Gatekeeper runs fully without it.
+yara = ["yara-python"]
+all = ["pip-audit", "yara-python"]
 
 [tool.setuptools]
 packages = ["gatekeeper_scanner"]
