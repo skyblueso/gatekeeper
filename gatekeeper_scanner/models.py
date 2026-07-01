@@ -205,6 +205,9 @@ class ScanReport:
     git_history_skipped: bool = False
     severity_summary: Dict = field(default_factory=dict)
     category_summary: Dict = field(default_factory=dict)
+    coverage_gaps: List[Dict] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    disabled_checks: List[str] = field(default_factory=list)
 
     _all_findings: List[Finding] = field(default_factory=list, repr=False)
 
@@ -227,6 +230,9 @@ class ScanReport:
             "git_history_skipped": self.git_history_skipped,
             "severity_summary": self.severity_summary,
             "category_summary": self.category_summary,
+            "coverage_gaps": self.coverage_gaps,
+            "warnings": self.warnings,
+            "disabled_checks": self.disabled_checks,
         }
         d["suppressed_findings"] = [
             {"rule_id": f.rule_id, "file": f.file, "line": f.line,

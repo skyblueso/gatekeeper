@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.3.0] - 2026-07-02
+
+Security-hardening release. Two independent adversarial review passes drove a set of fixes to the verification and trust layers, closing real false negatives where the scanner could be talked out of reporting something it had actually found. No detection capability was removed; the scanner is harder to trick into staying quiet. Test suite grew from 297 to 335, all passing; self-scan stays grade A.
+
+### Fixed
+- **Scanner self-detection could silently drop real findings in third-party code.** The false-positive suppression that keeps Gatekeeper's own pattern definitions from grading itself was keyed on filenames (`endswith`), so any third-party repo containing a file named `core.py`, `patterns.py`, etc. had real findings suppressed. Suppression is now gated on a self-identity marker, matched by exact basename, and restricted to the files where signatures are actually defined. When a scanned target self-identifies as Gatekeeper, that is now disclosed in the report so it can never be silent.
+- **Leaked secrets could be dismissed as placeholders.** A real credential in git history was dropped when the commit message merely contained a word like "example"; a real key was dropped for containing "example" as an internal substring. The placeholder check now inspects the credential value itself, matches whole-value placeholders rather than substrings, and never runs against commit metadata.
+- **Trust cap on target-supplied config.** A locally scanned repo could use its own `.gatekeeper.json` (suppress lists, `exclude`, `severity_weights`) or inline `# gatekeeper: ignore` comments to hide findings. Target-supplied suppression can now only quiet LOW/MEDIUM non-secret findings; it can never suppress a `CRITICAL`, `HIGH`, or `SECRET` finding through any lever, and files a target excludes are disclosed as coverage gaps. Target `severity_weights` can no longer lower CRITICAL/HIGH below their built-in floor.
+- **Denial of service in self-scan detection.** The self-identity check read candidate files unbounded, so a file symlinked to `/dev/zero` could hang the scan. It now skips non-regular files and reads a bounded prefix.
+- **Silent coverage gaps.** Oversized files (over 500KB) and over-length lines are now disclosed in the report and SARIF (terminal warnings and `toolExecutionNotifications`) instead of being skipped silently, closing a padding-based evasion. Coverage disclosure now covers any scannable file, including extensionless ones (Dockerfile) and active-text formats like SVG, not just a fixed extension list.
+- **Phantom dependency reporting.** Fixed cross-ecosystem contamination (Python phantom deps attributed to `package.json` and vice versa) and a display cap that could silently drop the eleventh-and-beyond phantom package; suspicious packages now always surface and the overflow list is named, not just counted.
+- **`--skip-deps` is now loud**, stating in the report that dependency checks were disabled.
+- **zsh** added to the pipe-to-shell detection (`curl ... | zsh`), which previously matched only `sh` and `bash`.
+
+### Changed
+- `--version` and the version constant are now `1.3.0`.
+
 ## [1.2.0] - 2026-06-28
 
 Three new detection engines, all additive and degrading gracefully. Nothing in the existing detect/verify/score pipeline changed; new findings flow through verification and scoring like any other. 297 tests.

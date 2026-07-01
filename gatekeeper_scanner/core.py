@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper Security Scanner v1.2.0
+Gatekeeper Security Scanner v1.3.0
 
 Full-stack security analysis for GitHub repos, MCP servers, AI agent packages,
 and local projects. One command. Every check. Every time.
@@ -61,7 +61,7 @@ from gatekeeper_scanner.reporter import ReportPrinter, generate_sarif  # noqa: F
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
@@ -89,6 +89,18 @@ BINARY_EXTENSIONS = {
     ".bin", ".dat",
 }
 
+# Extensions that are legitimately not scanned (compiled binaries, images, media,
+# archives, fonts). A size skip on these is NOT a coverage gap. Everything else the
+# walk sees (source, config, dockerfile, cert, extensionless, etc.) is disclosed when
+# skipped for size, independent of the COVERAGE_SOURCE_EXTS fast-path whitelist.
+NON_SCANNED_EXTENSIONS = BINARY_EXTENSIONS | {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff", ".tif",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".wav", ".flac", ".ogg", ".webm",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".jar", ".war", ".whl", ".egg",
+}
+
 # Files that should be excluded from secret detection (translations, generated content)
 SECRET_SKIP_EXTENSIONS = {
     ".po", ".pot", ".mo",  # Gettext translation files — UI strings like "Enter your password" are not secrets
@@ -104,6 +116,20 @@ SKIP_DIRS = {
 MAX_FILE_SIZE = 500_000
 MAX_LINE_LENGTH = 2000
 MAX_TOTAL_FILES = 50_000
+
+# Identity marker for self-scan detection. The presence of this exact string inside a
+# gatekeeper_scanner/core.py file proves the scan target is Gatekeeper itself, so
+# pattern-definition suppression applies ONLY to a genuine self-scan, never to a
+# stranger's repo that merely contains a file named core.py.
+GATEKEEPER_SELF_ID = "gatekeeper-self-identity-marker-v1-do-not-remove"
+
+# Exact basenames of Gatekeeper's own source files. Matched by exact basename, never by
+# endswith(), so a stranger's malicious_core.py does not get pattern-definition suppression.
+SCANNER_SOURCE_FILENAMES = {
+    "gatekeeper.py", "scanner.py", "rules.py", "patterns.py", "ast_scanner.py",
+    "reporter.py", "core.py", "models.py", "yara_engine.py", "taint.py", "osv.py",
+}
+GIT_HISTORY_SCANNER_FILENAMES = {"patterns.py", "core.py", "ast_scanner.py", "reporter.py", "models.py"}
 
 SUPPRESSION_COMMENT = re.compile(r"(?:#|//|--)\s*gatekeeper:\s*ignore", re.IGNORECASE)
 
@@ -126,6 +152,15 @@ LANG_MAP = {
     ".sh": "Shell", ".bash": "Bash",
     ".c": "C", ".cpp": "C++", ".php": "PHP", ".lua": "Lua",
     ".pl": "Perl", ".cs": "C#",
+}
+
+# Extensions whose oversized or minified content could conceal a payload the scanner
+# then never inspects. Coverage gaps are only recorded for these types. Binaries,
+# images, and data blobs are skipped by design and not worth disclosing.
+COVERAGE_SOURCE_EXTS = set(LANG_MAP) | {
+    ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".env", ".html", ".htm", ".xml", ".sql", ".ps1", ".bat", ".zsh",
+    ".mjs", ".cjs",
 }
 
 ENTRY_POINT_NAMES = {
@@ -154,8 +189,29 @@ SECRET_PLACEHOLDERS = re.compile(
     r"username:password|"
     r"admin:admin|"
     r"root:root|"
-    r"(?:my|your|the)[_\-]?(?:user|password|secret)|"
+    r"(?:my|your|the)[_\-](?:user|password|secret)|"
     r"<[^>]+>"  # <your-key-here>
+    r")"
+)
+
+# Structural placeholders: these unambiguously mark a fake credential even when embedded
+# in a larger string, so they dismiss on a substring match. Descriptive words (example,
+# dummy, fake, sample, xxx, TODO, placeholder, test_key) are NOT here: they only mark a
+# placeholder when they are the whole value or dominate it, so a real high-entropy secret
+# that merely contains "example" is not dismissed.
+STRONG_PLACEHOLDERS = re.compile(
+    r"(?i)("
+    r"your[_\-]?\w*[_\-]?(?:key|token|secret|password|here)|"
+    r"replace[_\-]?me|"
+    r"insert[_\-]?\w*here|"
+    r"CHANGE[_\-]?ME|"
+    r"sk-ant-xxx|"
+    r"user:pass(?:word)?|"
+    r"username:password|"
+    r"admin:admin|"
+    r"root:root|"
+    r"(?:my|your|the)[_\-](?:user|password|secret)|"
+    r"<[^>]+>"
     r")"
 )
 
@@ -188,6 +244,7 @@ class SecurityScanner:
         self.max_files = self.config.get("max_files", max_files)
         self.exclude_patterns = exclude_patterns or self.config.get("exclude", [])
         self._original_exclude = list(self.exclude_patterns)
+        self._target_excludes: List[str] = []  # exclude patterns supplied by the TARGET (config + .gatekeeper-ignore)
         self._trust_explicit = trust_target  # Operator explicitly set trust
         self.trust_target = trust_target
         self._git_env = git_env or {}
@@ -201,6 +258,11 @@ class SecurityScanner:
         self._diff_files: Optional[Set[str]] = None
         self._project_suppress: List[Dict] = []
         self._custom_patterns: Dict[str, List] = {}
+        self._coverage_lock = threading.Lock()
+        self._coverage_gaps: List[Dict] = []
+        self._coverage_gap_keys: Set = set()
+        self._scanning_self = False
+        self._scan_root: Optional[str] = None
         self._load_custom_patterns()
 
     def _load_custom_patterns(self):
@@ -233,7 +295,15 @@ class SecurityScanner:
         if fpath in self._file_cache:
             return self._file_cache[fpath]
         try:
-            if os.path.getsize(fpath) > max_size:
+            size = os.path.getsize(fpath)
+            if size > max_size:
+                # Disclose oversized SOURCE/text files that go uninspected. A payload
+                # can hide in a file the scanner never reads. Disclosure only, never
+                # affects the grade.
+                if max_size == MAX_FILE_SIZE and os.path.splitext(fpath)[1].lower() in COVERAGE_SOURCE_EXTS:
+                    self._record_coverage_gap({
+                        "path": self._rel_path(fpath), "reason": "file_exceeds_500KB", "size": size,
+                    })
                 return None
             with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
@@ -244,6 +314,142 @@ class SecurityScanner:
             return content
         except (OSError, IOError):
             return None
+
+    def _rel_path(self, fpath: str) -> str:
+        """Best-effort repo-relative path so coverage gaps read consistently with the
+        rest of the report. Falls back to the absolute path if relativization fails
+        (different drive on Windows, no scan root yet)."""
+        try:
+            if self._scan_root:
+                return os.path.relpath(fpath, self._scan_root)
+        except (ValueError, TypeError):
+            pass
+        return fpath
+
+    def _record_coverage_gap(self, record: Dict):
+        """Record a file or line range the scanner could not inspect.
+        Disclosure only: coverage gaps never create findings or move the grade.
+        Deduplicated by (path, reason) so repeated reads collapse to one entry."""
+        key = (record.get("path"), record.get("reason"))
+        with self._coverage_lock:
+            if key in self._coverage_gap_keys:
+                return
+            self._coverage_gap_keys.add(key)
+            self._coverage_gaps.append(record)
+
+    def _emit_coverage_warnings(self):
+        """Summarize coverage gaps as warnings so they surface in terminal output and in
+        SARIF through the standard warning plumbing (same channel as the file-count cap).
+        Disclosure only: never creates findings or changes the grade."""
+        file_skips = [g for g in self._coverage_gaps if g.get("reason") == "file_exceeds_500KB"]
+        line_gaps = [g for g in self._coverage_gaps if "lines_exceed_2000_chars" in str(g.get("reason", ""))]
+        excluded = [g for g in self._coverage_gaps if g.get("reason") == "excluded_by_target_config"]
+        if file_skips:
+            self._add_warning(
+                f"Coverage: {len(file_skips)} file(s) over 500KB were not scanned. "
+                "Oversized content can hide payloads (see coverage_gaps)."
+            )
+        if line_gaps:
+            total = sum(int(g.get("count", 0)) for g in line_gaps)
+            self._add_warning(
+                f"Coverage: {total} line(s) over 2000 chars skipped across {len(line_gaps)} file(s). "
+                "Minified content can hide payloads (see coverage_gaps)."
+            )
+        if excluded:
+            names = ", ".join(sorted(str(g.get("path", "")) for g in excluded)[:30])
+            self._add_warning(
+                f"{len(excluded)} file(s) excluded from scan by target config: {names}. "
+                "Target-supplied excludes cannot silently drop files."
+            )
+
+    def _disabled_checks(self) -> List[str]:
+        """List the check categories the operator turned off, so the report can say so
+        out loud. --skip-deps alone can move a crafted target from F to D; silent is a
+        footgun."""
+        disabled = []
+        if self.skip_deps:
+            disabled.append("dependency + CVE audit (--skip-deps)")
+        if self.no_osv:
+            disabled.append("OSV vulnerability lookup (--no-osv)")
+        if self.no_taint:
+            disabled.append("taint analysis (--no-taint)")
+        if self.no_yara:
+            disabled.append("YARA signature scan (--no-yara)")
+        return disabled
+
+    def _is_placeholder_value(self, value: str) -> bool:
+        """True only when the value IS a placeholder, not merely contains a placeholder
+        word as a substring. Structural markers (your_key, admin:admin, <...>) count even
+        when embedded. Descriptive words (example, dummy, fake, xxx, ...) count only when
+        they are the whole value or dominate it. This keeps a real high-entropy secret that
+        happens to contain "example" from being dismissed, and keeps a commit message in a
+        git-history snippet from dismissing a real leaked secret."""
+        if not value:
+            return False
+        v = value.strip().strip("'\"")
+        if not v:
+            return False
+        if STRONG_PLACEHOLDERS.search(v):
+            return True
+        m = SECRET_PLACEHOLDERS.search(v)
+        if not m:
+            return False
+        token = m.group(0)
+        if token.lower() == v.lower():
+            return True
+        # Descriptive marker: only a placeholder when it dominates the value, not when it
+        # is an internal substring of a longer real secret.
+        return len(token) >= 0.6 * len(v)
+
+    def _is_signature_definition_file(self, path: str) -> bool:
+        """Signatures are legitimately defined only at the real package paths
+        gatekeeper_scanner/patterns.py, gatekeeper_scanner/taint.py, and
+        gatekeeper_scanner/yara_rules/*.yar. Exact path components are required (not a
+        substring), so a forged src/patterns.py or not_yara_rules/payload.yar does NOT
+        qualify and its SIGNATURE hit is not suppressed during a self-scan."""
+        parts = (path or "").replace("\\", "/").split("/")
+        if len(parts) >= 2 and parts[-2] == "gatekeeper_scanner" and parts[-1] in ("patterns.py", "taint.py"):
+            return True
+        if parts[-1].endswith(".yar") and "gatekeeper_scanner" in parts:
+            gi = parts.index("gatekeeper_scanner")
+            if gi + 1 < len(parts) and parts[gi + 1] == "yara_rules":
+                return True
+        return False
+
+    def _detect_self_scan(self, root: Optional[str]) -> bool:
+        """Return True only when the scan target is Gatekeeper itself.
+
+        Identity is proven by GATEKEEPER_SELF_ID inside a gatekeeper_scanner/core.py
+        file, never by filename. A stranger's repo that merely contains a file named
+        core.py does not carry the marker, so its findings get full scrutiny. Bounded:
+        collects at most a handful of candidate core.py files and reads them."""
+        try:
+            candidates: List[str] = []
+            if root and os.path.isfile(root):
+                candidates.append(root)
+            elif root and os.path.isdir(root):
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+                    if os.path.basename(dirpath) == "gatekeeper_scanner" and "core.py" in filenames:
+                        candidates.append(os.path.join(dirpath, "core.py"))
+                    if len(candidates) >= 5:
+                        break
+            for c in candidates[:5]:
+                try:
+                    # Regular files only: skip symlinks, devices, and fifos so a core.py
+                    # symlinked to /dev/zero cannot hang the scan or fake a self-scan.
+                    if not os.path.isfile(c) or os.path.islink(c):
+                        continue
+                    with open(c, "r", encoding="utf-8", errors="ignore") as fh:
+                        # The sentinel sits near the top; a bounded read avoids reading an
+                        # unbounded stream even if a pathological regular file slips through.
+                        if GATEKEEPER_SELF_ID in fh.read(65536):
+                            return True
+                except (OSError, IOError):
+                    continue
+        except Exception:
+            return False
+        return False
 
     def _resolve_binary(self, name: str) -> Optional[str]:
         """Resolve full path to a binary, or None if not found."""
@@ -274,8 +480,13 @@ class SecurityScanner:
         self.findings = []
         self.warnings = []
         self._project_suppress = []
+        self._coverage_gaps = []
+        self._coverage_gap_keys = set()
+        self._scanning_self = False
+        self._scan_root = None
         self._load_custom_patterns()
         self.exclude_patterns = list(self._original_exclude)
+        self._target_excludes = []
         start = datetime.now()
         scan_type, scan_path = self._resolve_target(target)
         # Auto-set trust: local dirs are trusted (user's own code), remote repos are not
@@ -295,15 +506,38 @@ class SecurityScanner:
             report.recommendation = "Could not access target."
             return report
 
+        # Identity gate: pattern-definition suppression fires only for a real self-scan,
+        # never because a stranger's repo happens to contain a file named core.py.
+        self._scanning_self = self._detect_self_scan(scan_path)
+        # Scan root, so coverage gaps can be recorded as repo-relative paths.
+        self._scan_root = scan_path
+        if self._scanning_self:
+            # Disclose (once per scan) that pattern-definition suppression is active, so a
+            # forged self-scan is never silent.
+            self._add_warning(
+                "Target self-identifies as Gatekeeper (identity marker present); scanner "
+                "pattern-definition suppression is active. If this is not the Gatekeeper "
+                "project itself, treat suppressed findings as real."
+            )
+
         try:
             # Load project config (only from trusted targets)
             if self.trust_target:
                 project_cfg = self._load_project_config(scan_path)
                 if project_cfg:
                     if "exclude" in project_cfg:
+                        self._target_excludes.extend(project_cfg["exclude"])
                         self.exclude_patterns = list(set(self.exclude_patterns + project_cfg["exclude"]))
                     if "severity_weights" in project_cfg:
-                        self.config["severity_weights"].update(project_cfg["severity_weights"])
+                        # Trust cap: target config may raise weights, but may NEVER lower the
+                        # weight of a high-severity class below the built-in default (so a
+                        # target cannot score its own HIGH-only repo as A via {"HIGH": 0}).
+                        default_w = DEFAULT_CONFIG["severity_weights"]
+                        for sev, w in project_cfg["severity_weights"].items():
+                            if sev in ("CRITICAL", "HIGH"):
+                                self.config["severity_weights"][sev] = max(default_w.get(sev, 0), w)
+                            else:
+                                self.config["severity_weights"][sev] = w
                     if "custom_patterns" in project_cfg:
                         for cp in project_cfg["custom_patterns"]:
                             for lang in cp.get("languages", []):
@@ -375,6 +609,10 @@ class SecurityScanner:
             report.structure["tool_type"] = report.tool_type
             report.grade_drivers = self._build_grade_drivers(verified)
             report.git_history_skipped = any("shallow clone" in w for w in self.warnings)
+            report.coverage_gaps = list(self._coverage_gaps)
+            self._emit_coverage_warnings()
+            report.warnings = list(self.warnings)
+            report.disabled_checks = self._disabled_checks()
             report.duration_seconds = (datetime.now() - start).total_seconds()
 
         finally:
@@ -440,7 +678,8 @@ class SecurityScanner:
             clone_cmd.extend(["--", url, temp_dir + "/repo"])
             result = subprocess.run(
                 clone_cmd,
-                capture_output=True, text=True, timeout=300, env=clone_env
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=300, env=clone_env
             )
             if result.returncode != 0:
                 logger.warning("Clone failed: %s", result.stderr.strip())
@@ -480,6 +719,7 @@ class SecurityScanner:
                             line = line.strip()
                             if line and not line.startswith("#"):
                                 self.exclude_patterns.append(line)
+                                self._target_excludes.append(line)
                 except OSError:
                     pass
 
@@ -514,6 +754,10 @@ class SecurityScanner:
 
                 # Exclude patterns
                 if self.exclude_patterns and any(fnmatch.fnmatch(rel_path, p) for p in self.exclude_patterns):
+                    # A target-supplied exclude drops a file before any detector runs, so the
+                    # trust cap never sees it. Disclose it so exclusion is never silent.
+                    if self._target_excludes and any(fnmatch.fnmatch(rel_path, p) for p in self._target_excludes):
+                        self._record_coverage_gap({"path": rel_path, "reason": "excluded_by_target_config"})
                     continue
 
                 # Diff mode: only scan changed files
@@ -622,6 +866,15 @@ class SecurityScanner:
                 if ext not in BINARY_EXTENSIONS and fsize <= MAX_FILE_SIZE:
                     _add_text_file(fpath, rel_path, ext)
 
+                # Coverage disclosure: a scannable (not binary/image/media) file skipped
+                # for size would have been scanned. Disclose it so an oversized Dockerfile,
+                # .pem, .key, or extensionless config cannot hide a payload silently. Driven
+                # by categorization, not the COVERAGE_SOURCE_EXTS whitelist.
+                if fsize > MAX_FILE_SIZE and ext not in NON_SCANNED_EXTENSIONS:
+                    self._record_coverage_gap({
+                        "path": rel_path, "reason": "file_exceeds_500KB", "size": fsize,
+                    })
+
         cats.structure = structure
         return cats
 
@@ -719,18 +972,33 @@ class SecurityScanner:
             lines = content.split("\n")
 
             ct = self._CommentTracker(ext)
+            long_line_skips = 0
             for i, line in enumerate(lines, 1):
-                if len(line) > MAX_LINE_LENGTH or ct.is_comment(line):
+                if len(line) > MAX_LINE_LENGTH:
+                    long_line_skips += 1
                     continue
-                if self.trust_target and SUPPRESSION_COMMENT.search(line):
+                if ct.is_comment(line):
                     continue
+                suppress_line = self.trust_target and bool(SUPPRESSION_COMMENT.search(line))
                 for pattern, category, severity, message in patterns:
                     if re.search(pattern, line):
+                        # Inline "gatekeeper: ignore" may quiet only LOW/MEDIUM non-secret
+                        # noise; a target's comment can never hide a CRITICAL, HIGH, or SECRET.
+                        if suppress_line and severity in ("LOW", "MEDIUM") and category != "SECRET":
+                            continue
                         results.append(Finding(
                             severity=severity, category=category,
                             file=rel_path, line=i,
                             message=message, snippet=line.strip()[:120],
                         ))
+            if long_line_skips:
+                # Disclose lines skipped for length. A payload can hide past 2000 chars
+                # on a minified line the pattern scanner never inspects. Disclosure only.
+                self._record_coverage_gap({
+                    "path": rel_path,
+                    "reason": f"{long_line_skips}_lines_exceed_2000_chars",
+                    "count": long_line_skips,
+                })
             return results
 
         workers = min(8, (os.cpu_count() or 4))
@@ -827,12 +1095,19 @@ class SecurityScanner:
             for pattern, label in SECRET_PATTERNS:
                 for m in re.finditer(pattern, content):
                     matched = m.group(0)
-                    # Extract value portion (between quotes) for placeholder check —
-                    # checking the full match would dismiss real secrets assigned to
-                    # variables named "your_api_key" because "your" is a placeholder word
+                    # Extract the value portion for the placeholder check. Checking the
+                    # full match would dismiss real secrets assigned to variables named
+                    # like "your_api_key" (the "your" prefix is a placeholder word).
+                    # Quoted value wins; otherwise strip a leading "name =" / "name:"
+                    # assignment prefix so an unquoted real secret is judged by its value,
+                    # not its variable name. Bare tokens (no assignment) are checked whole.
                     value_match = re.search(r"""['\"]([^'"]+)['\"]""", matched)
-                    check_str = value_match.group(1) if value_match else matched
-                    if SECRET_PLACEHOLDERS.search(check_str):
+                    if value_match:
+                        check_str = value_match.group(1)
+                    else:
+                        assign = re.match(r"""^[\w.\-]+\s*[=:]\s*(.+)$""", matched)
+                        check_str = assign.group(1).strip().strip("'\"") if assign else matched
+                    if self._is_placeholder_value(check_str):
                         continue
                     line_num = content[:m.start()].count("\n") + 1
                     if len(matched) > 12:
@@ -1045,10 +1320,12 @@ class SecurityScanner:
             for i, line in enumerate(lines, 1):
                 if len(line) > MAX_LINE_LENGTH or ct.is_comment(line):
                     continue
-                if self.trust_target and SUPPRESSION_COMMENT.search(line):
-                    continue
+                suppress_line = self.trust_target and bool(SUPPRESSION_COMMENT.search(line))
                 for pattern, category, severity, message in self.PROMPT_INJECTION_CODE_PATTERNS:
                     if re.search(pattern, line, re.IGNORECASE):
+                        # Inline ignore may quiet only LOW/MEDIUM non-secret noise.
+                        if suppress_line and severity in ("LOW", "MEDIUM") and category != "SECRET":
+                            continue
                         self._add_finding(Finding(
                             severity=severity, category=category,
                             file=rel_path, line=i,
@@ -1287,7 +1564,7 @@ class SecurityScanner:
         try:
             result = subprocess.run(
                 ["git", "log", "--all", "-G", combined_pattern, "--oneline"],
-                capture_output=True, text=True, timeout=30, cwd=scan_path
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=scan_path
             )
             if result.stdout.strip():
                 commits = result.stdout.strip().split("\n")
@@ -1370,8 +1647,9 @@ class SecurityScanner:
                     continue
                 if ct.is_comment(line):
                     continue
-                if self.trust_target and SUPPRESSION_COMMENT.search(line):
-                    continue
+                # Inline ignore may quiet only the LOW/MEDIUM obfuscation signal below; the
+                # CRITICAL string-concat/chr and HIGH invisible-unicode findings always emit.
+                suppress_line = self.trust_target and bool(SUPPRESSION_COMMENT.search(line))
 
                 # String concatenation evasion
                 for cm in re.findall(r"""['"]\w{1,6}['"]\s*\+\s*['"]\w{1,6}['"]""", line):
@@ -1409,7 +1687,7 @@ class SecurityScanner:
                     if len(s) < 200 and re.fullmatch(r'[A-Za-z0-9+/]+={1,2}', s):
                         continue
                     entropy = self._shannon_entropy(s)
-                    if entropy > 4.5 and len(s) > 50:
+                    if entropy > 4.5 and len(s) > 50 and not suppress_line:
                         self._add_finding(Finding(
                             severity="MEDIUM", category="OBFUSCATION", file=rel_path, line=i,
                             message=f"High-entropy string (entropy={entropy:.1f}) — possible encoded payload",
@@ -1686,18 +1964,24 @@ class SecurityScanner:
 
         py_declared: Set[str] = set()
         py_optional: Set[str] = set()
+        py_sources: Dict[str, str] = {}  # pkg -> manifest basename it was declared in
         if os.path.exists(req_file):
             report["package_manager"] = "pip"
-            py_declared |= self._scan_python_deps(req_file, report, path)
+            req_declared = self._scan_python_deps(req_file, report, path)
+            py_declared |= req_declared
+            for pkg in req_declared:
+                py_sources.setdefault(pkg, "requirements.txt")
         if os.path.exists(pyproject):
             report["package_manager"] = "pip"
             proj_declared, proj_optional = self._scan_pyproject_deps(pyproject, report)
             py_declared |= proj_declared
             py_optional |= proj_optional
+            for pkg in proj_declared:
+                py_sources.setdefault(pkg, "pyproject.toml")
 
         # Unified phantom dep check — run once after both sources have contributed
         if py_declared:
-            self._check_phantom_deps_python(py_declared, path, report, py_optional)
+            self._check_phantom_deps_python(py_declared, path, report, py_optional, py_sources)
 
         pkg_json = os.path.join(path, "package.json")
         if os.path.exists(pkg_json):
@@ -1753,7 +2037,41 @@ class SecurityScanner:
             self._add_warning(f"Could not read requirements.txt: {e}")
         return declared
 
-    def _check_phantom_deps_python(self, declared: Set[str], scan_path: str, report: Dict, optional_declared: Optional[Set[str]] = None):
+    def _emit_phantom_findings(self, new_phantoms, source_of, suspicious_names, cap=10):
+        """Emit phantom-dependency findings with a display cap that is never silent and
+        never hides a dangerous one. A phantom that is ALSO on the suspicious/typosquat list
+        bypasses the cap and always emits; when the count exceeds the cap the overflow is
+        disclosed via a warning (so the [:10] slice can never quietly drop the 11th, which
+        could be the malicious install-hook package)."""
+        suspicious_lower = {str(s).lower() for s in suspicious_names}
+
+        def is_suspicious(dep):
+            base = dep.split("/")[0].lower()
+            return base in suspicious_lower or dep.lower() in suspicious_lower
+
+        flagged = [p for p in new_phantoms if is_suspicious(p)]
+        ordinary = [p for p in new_phantoms if not is_suspicious(p)]
+        shown, seen = [], set()
+        for pkg in flagged + ordinary[:cap]:
+            if pkg not in seen:
+                seen.add(pkg)
+                shown.append(pkg)
+        for pkg in shown:
+            self._add_finding(Finding(
+                severity="MEDIUM", category="DEPENDENCY",
+                file=source_of(pkg), line=0,
+                message=f"Phantom dependency: '{pkg}' declared but never imported",
+            ))
+        omitted = [p for p in new_phantoms if p not in seen]
+        if omitted:
+            # List every omitted NAME, so a novel malicious package beyond the cap that is
+            # not on the suspicious list is still visible to a human, never just a count.
+            self._add_warning(
+                f"{len(omitted)} additional phantom dependency(ies) not individually listed "
+                f"(display cap reached): {', '.join(sorted(omitted))}."
+            )
+
+    def _check_phantom_deps_python(self, declared: Set[str], scan_path: str, report: Dict, optional_declared: Optional[Set[str]] = None, declared_sources: Optional[Dict[str, str]] = None):
         imported = set()
         for fpath, content in self._file_cache.items():
             if not fpath.endswith(".py") or os.path.basename(fpath) in ("setup.py", "conftest.py"):
@@ -1789,17 +2107,19 @@ class SecurityScanner:
                      "maturin", "cython", "poetry", "poetry-core", "pdm", "pdm-backend"}
         dev_tools |= optional_declared or set()
 
+        declared_sources = declared_sources or {}
+        new_phantoms = []  # only the phantoms THIS check found, never another ecosystem's
         for pkg in declared:
             import_name = pkg_to_import.get(pkg, pkg.replace("-", "_").replace(".", "_"))
             if import_name not in imported and pkg not in imported and pkg not in dev_tools:
                 report["phantom_deps"].append(pkg)
+                new_phantoms.append(pkg)
 
-        for pkg in report["phantom_deps"][:10]:
-            self._add_finding(Finding(
-                severity="MEDIUM", category="DEPENDENCY",
-                file="requirements.txt", line=0,
-                message=f"Phantom dependency: '{pkg}' declared but never imported",
-            ))
+        self._emit_phantom_findings(
+            new_phantoms,
+            lambda p: declared_sources.get(p, "requirements.txt"),
+            SUSPICIOUS_PACKAGES_PY,
+        )
 
     def _scan_pyproject_deps(self, pyproject: str, report: Dict):
         declared = set()
@@ -1947,17 +2267,14 @@ class SecurityScanner:
                       "@types", "tailwindcss", "postcss", "autoprefixer", "nodemon",
                       "husky", "lint-staged", "commitlint", "@commitlint",
                       "semantic-release", "release-it", "turbo", "lerna", "nx"}
+        new_phantoms = []  # only JS phantoms found here (the shared list also holds Python phantoms)
         for dep in deps:
             base = dep.split("/")[0]
             if base not in imported and dep not in imported and base not in build_deps and not base.startswith("@types"):
                 report["phantom_deps"].append(dep)
+                new_phantoms.append(dep)
 
-        for dep in report["phantom_deps"][:10]:
-            self._add_finding(Finding(
-                severity="MEDIUM", category="DEPENDENCY",
-                file="package.json", line=0,
-                message=f"Phantom dependency: '{dep}' declared but never imported",
-            ))
+        self._emit_phantom_findings(new_phantoms, lambda p: "package.json", SUSPICIOUS_PACKAGES_JS)
 
     def _check_lockfile_integrity(self, path: str, report: Dict):
         lock_file = os.path.join(path, "package-lock.json")
@@ -2029,7 +2346,7 @@ class SecurityScanner:
         try:
             result = subprocess.run(
                 [govulncheck_bin, "-json", "./..."],
-                capture_output=True, text=True, timeout=60, cwd=scan_path
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, cwd=scan_path
             )
             if result.stdout:
                 try:
@@ -2074,7 +2391,7 @@ class SecurityScanner:
         try:
             result = subprocess.run(
                 [cargo_bin, "audit", "--json"],
-                capture_output=True, text=True, timeout=60, cwd=scan_path
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, cwd=scan_path
             )
             if result.stdout:
                 try:
@@ -2104,7 +2421,7 @@ class SecurityScanner:
             return
         try:
             result = subprocess.run([pip_audit_bin, "--format", "json", "-r", req],
-                                    capture_output=True, text=True, timeout=30)
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
             if result.stdout:
                 try:
                     data = json.loads(result.stdout)
@@ -2137,7 +2454,7 @@ class SecurityScanner:
             self._add_warning("npm not found — CVE scanning skipped")
             return
         try:
-            result = subprocess.run([npm_bin, "audit", "--json", "--omit=dev"], capture_output=True, text=True, timeout=30, cwd=path)
+            result = subprocess.run([npm_bin, "audit", "--json", "--omit=dev"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=path)
             if result.stdout:
                 for name, info in json.loads(result.stdout).get("vulnerabilities", {}).items():
                     sev = info.get("severity", "low")
@@ -2376,7 +2693,7 @@ class SecurityScanner:
         if not mcp_bin:
             return False
         try:
-            return subprocess.run([mcp_bin, "--version"], capture_output=True, text=True, timeout=5).returncode == 0
+            return subprocess.run([mcp_bin, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5).returncode == 0
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
@@ -2439,11 +2756,23 @@ class SecurityScanner:
         self._apply_cross_detector_dedup()
 
     def _verify_scanner_self_detection(self, f):
-        """Suppress findings in scanner source files (rule definitions, not vulnerabilities)."""
-        if f.file.endswith(("gatekeeper.py", "scanner.py", "rules.py", "patterns.py", "ast_scanner.py", "reporter.py", "core.py", "models.py", "yara_engine.py", "taint.py", "osv.py")):
-            if f.category == "SIGNATURE":
+        """Suppress findings in scanner source files (rule definitions, not vulnerabilities).
+
+        Gated on identity: only fires when the scan target is Gatekeeper itself
+        (sentinel marker), so a third-party repo that merely names a file core.py
+        keeps full scrutiny. The filename/snippet sub-checks below remain the second
+        discriminator layer during a genuine self-scan."""
+        if not self._scanning_self:
+            return
+        # SIGNATURE hits are suppressed ONLY in files where signatures are legitimately
+        # DEFINED (patterns.py, taint.py, yara_rules/*.yar). A real signature match in any
+        # other scanner file (core.py, reporter.py, models.py, ...) is suspicious even in
+        # Gatekeeper itself, so it is NOT suppressed during a self-scan.
+        if f.category == "SIGNATURE":
+            if self._is_signature_definition_file(f.file):
                 self._dismiss(f, "pattern_definition", "Signature string in scanner's own rule/pattern definitions, not a real payload")
-                return
+            return
+        if os.path.basename(f.file) in SCANNER_SOURCE_FILENAMES:
             # Detector logic: a dangerous-API name appearing INSIDE a string
             # literal (sink label or name comparison, e.g. "yaml.load()",
             # chain == "__import__") is a definition, not a call. Real calls have
@@ -2464,14 +2793,18 @@ class SecurityScanner:
                 return
 
     def _verify_git_history_self_detection(self, f):
-        """Dismiss git history findings when scanning a repo that contains scanner pattern files.
+        """Dismiss git history findings when scanning Gatekeeper itself.
         The scanner's own secret detection patterns (regex strings like 'sk_live_...')
         appear in core.py and patterns.py — git -G matches them as 'secrets in history'
-        but they're pattern definitions, not leaked credentials."""
+        but they're pattern definitions, not leaked credentials.
+
+        Gated on identity so a third-party repo that vendors a file named core.py can no
+        longer get real leaked-secret history findings silently dismissed."""
+        if not self._scanning_self:
+            return
         if f.file == ".git/history" and f.category == "SECRET":
-            # Check if any scanner source files exist in the current findings set
-            scanner_files = {"patterns.py", "core.py", "ast_scanner.py", "reporter.py", "models.py"}
-            if any(any(sf.endswith(name) for name in scanner_files) for sf in
+            # Check if any scanner source file (exact basename) is in the current findings.
+            if any(os.path.basename(sf) in GIT_HISTORY_SCANNER_FILENAMES for sf in
                    {ff.file for ff in self.findings if ff.file}):
                 self._dismiss(f, "scanner_self_detection",
                              "Git history contains scanner pattern definitions (regex strings), not leaked credentials")
@@ -2530,7 +2863,22 @@ class SecurityScanner:
                 return
 
     def _apply_project_suppressions(self, f):
-        """Apply project config (.gatekeeper.json) suppressions."""
+        """Apply project config (.gatekeeper.json) suppressions.
+
+        Trust cap: target-supplied config may quiet only LOW/MEDIUM non-secret noise. It may
+        NEVER suppress a CRITICAL, HIGH, or SECRET finding, so a malicious local repo cannot
+        use its own .gatekeeper.json to silence its leaked key or a high-severity RCE."""
+        if not (f.severity in ("LOW", "MEDIUM") and f.category != "SECRET"):
+            if self._project_suppress and any(
+                f.rule_id == sup.get("rule") and any(fnmatch.fnmatch(f.file, fp) for fp in sup.get("files", []))
+                for sup in self._project_suppress
+            ):
+                self._add_warning(
+                    f"Ignored a project-config suppression for a {f.severity}/{f.category} finding "
+                    f"({f.rule_id or 'rule'} in {f.file}). Target-supplied config cannot silence "
+                    "critical or secret findings."
+                )
+            return
         if self._project_suppress:
             for sup in self._project_suppress:
                 if f.rule_id == sup.get("rule") and any(fnmatch.fnmatch(f.file, fp) for fp in sup.get("files", [])):
@@ -2647,7 +2995,11 @@ class SecurityScanner:
 
         # --- SECRET verification ---
         if f.category == "SECRET":
-            if f.snippet and SECRET_PLACEHOLDERS.search(f.snippet):
+            # Placeholder dismissal must judge the secret VALUE, not surrounding metadata.
+            # A git-history snippet is the commit oneline (message), which is why a commit
+            # message like "example config" must NOT dismiss a real leaked secret, and a
+            # real high-entropy secret containing "example" as a substring must survive.
+            if f.file != ".git/history" and f.snippet and self._is_placeholder_value(f.snippet):
                 self._dismiss(f, "placeholder", "Value matches placeholder pattern")
                 return
             if f.snippet and re.search(r'\$\{\{?\s*secrets\.', f.snippet):
@@ -3179,7 +3531,7 @@ def main():
             pass  # Python 3.6 or non-reconfigurable stream
 
     parser = argparse.ArgumentParser(
-        description="Gatekeeper Security Scanner v1.2.0",
+        description="Gatekeeper Security Scanner v1.3.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python3 gatekeeper.py https://github.com/user/repo\n"
@@ -3279,7 +3631,7 @@ def main():
         if os.path.isdir(diff_target):
             diff_result = subprocess.run(
                 ["git", "diff", "--name-only", args.diff, "HEAD"],
-                capture_output=True, text=True, cwd=diff_target
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=diff_target
             )
             if diff_result.returncode == 0 and diff_result.stdout.strip():
                 scanner._diff_files = set(diff_result.stdout.strip().split("\n"))

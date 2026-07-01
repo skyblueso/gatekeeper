@@ -6,7 +6,7 @@
 
 Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https://x.com/simchabrodsky))
 
-![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-297%20passing-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-335%20passing-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -53,7 +53,7 @@ $ python3 gatekeeper.py --self-scan
 
   Scanning: /path/to/security-scanner...
 
-  Discovered 45 potential vulnerabilities. Investigating...
+  Discovered 52 potential vulnerabilities. Investigating...
 
   ============================================================
     SECURITY SCAN REPORT
@@ -65,13 +65,13 @@ $ python3 gatekeeper.py --self-scan
 
   STRUCTURE
   Languages:    Python (100%)
-  Files:        10 source, 4 config, 27 total
-  Lines:        7,618
-  Size:         433.2 KB
+  Files:        12 source, 3 config, 29 total
+  Lines:        9,686
+  Size:         520.0 KB
   Detected:     SKILL.md, CI/CD
 
-  DISCOVERY (45 potential vulnerabilities: 3 MEDIUM, 42 LOW)
-  342 detections dismissed as false positives.
+  DISCOVERY (52 potential vulnerabilities: 2 MEDIUM, 50 LOW)
+  451 detections dismissed as false positives.
 
    !   [FILESYSTEM] shutil.rmtree(): recursive directory deletion
        gatekeeper_scanner/core.py:370
@@ -310,6 +310,8 @@ Drop a `.gatekeeper.json` file in your project root to configure project-level b
 ## Suppression
 
 Two suppression mechanisms exist. Both are trust-gated: they only work when Gatekeeper trusts the scan target. They have no effect when scanning an untrusted remote repo, which prevents a malicious repo from suppressing its own findings.
+
+Even on a trusted target, suppression has a hard floor: it can quiet LOW and MEDIUM noise, but it can **never** hide a `CRITICAL`, `HIGH`, or `SECRET` finding, no matter which lever is used (config `suppress`, inline `# gatekeeper: ignore`, or `severity_weights`). When a target's config tries to silence one of those, the finding still surfaces and the attempt is reported. Files a target's own config excludes from the scan are disclosed too, so nothing can be quietly dropped before it is even looked at. The idea is simple: a repo you are evaluating should never be able to talk Gatekeeper out of showing you something serious.
 
 **Inline suppression**: add a comment on the line with the finding:
 

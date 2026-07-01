@@ -142,8 +142,8 @@ DANGEROUS_JS = [
 ]
 
 DANGEROUS_SHELL = [
-    (r"\bcurl\b.*\|\s*(?:ba)?sh", "EXECUTION", "CRITICAL", "curl piped to shell — remote code execution"),
-    (r"\bwget\b.*\|\s*(?:ba)?sh", "EXECUTION", "CRITICAL", "wget piped to shell — remote code execution"),
+    (r"\bcurl\b.*\|\s*(?:ba|z)?sh", "EXECUTION", "CRITICAL", "curl piped to shell — remote code execution"),
+    (r"\bwget\b.*\|\s*(?:ba|z)?sh", "EXECUTION", "CRITICAL", "wget piped to shell — remote code execution"),
     (r"\brm\s+-rf\s+/", "FILESYSTEM", "CRITICAL", "rm -rf / — catastrophic deletion"),
     (r"\bchmod\s+777\b", "PERMISSION", "HIGH", "chmod 777 — world-writable permissions"),
     (r"\bchmod\s+\+s\b", "PERMISSION", "CRITICAL", "setuid bit — privilege escalation"),
@@ -352,8 +352,8 @@ AI_CONFIG_INJECTION_PATTERNS = [
 DOCKERFILE_PATTERNS = [
     (r"^USER\s+root\s*$", "PERMISSION", "HIGH", "Container running as root user"),
     (r"^(?:ARG|ENV)\s+(?:.*(?:PASSWORD|SECRET|TOKEN|KEY|CREDENTIAL|AUTH).*=)", "SECRET", "HIGH", "Secret in Dockerfile ARG/ENV — persists in image layers"),
-    (r"RUN\s+.*curl\s+.*\|\s*(?:ba)?sh", "EXECUTION", "CRITICAL", "curl piped to shell in Dockerfile — remote code execution"),
-    (r"RUN\s+.*wget\s+.*\|\s*(?:ba)?sh", "EXECUTION", "CRITICAL", "wget piped to shell in Dockerfile — remote code execution"),
+    (r"RUN\s+.*curl\s+.*\|\s*(?:ba|z)?sh", "EXECUTION", "CRITICAL", "curl piped to shell in Dockerfile — remote code execution"),
+    (r"RUN\s+.*wget\s+.*\|\s*(?:ba|z)?sh", "EXECUTION", "CRITICAL", "wget piped to shell in Dockerfile — remote code execution"),
     (r"RUN\s+.*chmod\s+777", "PERMISSION", "HIGH", "chmod 777 in container — world-writable"),
     (r"RUN\s+.*apt-get\s+install.*-y.*(?:--allow-unauthenticated|--force-yes)", "PERMISSION", "HIGH", "Unauthenticated package install in Docker"),
     (r"COPY\s+\.\s+\.", "FILESYSTEM", "MEDIUM", "COPY . . in Dockerfile — may copy secrets from build context"),
@@ -377,8 +377,8 @@ GITHUB_ACTIONS_PATTERNS = [
 ]
 
 MAKEFILE_PATTERNS = [
-    (r"curl\s+.*\|\s*(?:ba)?sh", "EXECUTION", "CRITICAL", "Makefile: curl piped to shell"),
-    (r"wget\s+.*\|\s*(?:ba)?sh", "EXECUTION", "CRITICAL", "Makefile: wget piped to shell"),
+    (r"curl\s+.*\|\s*(?:ba|z)?sh", "EXECUTION", "CRITICAL", "Makefile: curl piped to shell"),
+    (r"wget\s+.*\|\s*(?:ba|z)?sh", "EXECUTION", "CRITICAL", "Makefile: wget piped to shell"),
     (r"rm\s+-rf\s+/", "FILESYSTEM", "CRITICAL", "Makefile: rm -rf / — catastrophic"),
     (r"chmod\s+777", "PERMISSION", "HIGH", "Makefile: chmod 777"),
     (r"sudo\s+", "PERMISSION", "MEDIUM", "Makefile: sudo usage"),

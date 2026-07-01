@@ -155,9 +155,10 @@ class _SecurityVisitor(ast.NodeVisitor):
 
     def _add(self, node: ast.AST, severity: str, category: str, message: str):
         lineno = getattr(node, "lineno", 0)
-        # Honor inline suppression comments on trusted targets
+        # Honor inline suppression comments on trusted targets, but only for LOW/MEDIUM
+        # non-secret noise. A target's comment can never hide a CRITICAL, HIGH, or SECRET.
         if self._trust_target and 0 < lineno <= len(self.lines):
-            if _SUPPRESSION_RE.search(self.lines[lineno - 1]):
+            if _SUPPRESSION_RE.search(self.lines[lineno - 1]) and severity in ("LOW", "MEDIUM") and category != "SECRET":
                 return
         self.findings.append(Finding(
             severity=severity,

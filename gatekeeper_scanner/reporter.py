@@ -97,6 +97,10 @@ class ReportPrinter:
         print(f"  {self.DIM}Type:{self.RESET}    {report.scan_type}")
         print(f"  {self.DIM}Time:{self.RESET}    {report.timestamp[:19]}")
         print(f"  {self.DIM}Scan:{self.RESET}    {report.duration_seconds:.1f}s")
+        disabled = getattr(report, "disabled_checks", None)
+        if disabled:
+            print(f"  {self.YELLOW}Disabled:{self.RESET} {', '.join(disabled)}")
+            print(f"  {self.DIM}         Grade reflects a reduced scan. Disabled checks can hide risk.{self.RESET}")
         print(f"  {self.BOLD}{'-' * w}{self.RESET}")
 
     def _print_structure(self, s: Dict):
@@ -318,4 +322,15 @@ def generate_sarif(report: ScanReport, version: str = "1.0.0") -> Dict:
             }] if f.file else [],
         }
         run["results"].append(result)
+
+    # Coverage gaps and other scan warnings surface here as execution notifications,
+    # not as results, so CI sees the disclosure without it affecting any gate or grade.
+    notifications = [
+        {"level": "warning", "message": {"text": w}}
+        for w in getattr(report, "warnings", [])
+    ]
+    run["invocations"] = [{
+        "executionSuccessful": True,
+        "toolExecutionNotifications": notifications,
+    }]
     return sarif
