@@ -2,73 +2,95 @@
 
 ![Gatekeeper](banner.png)
 
-**Security analysis for GitHub repos, MCP servers, and AI agent packages. One scan, before you install.**
+**Is this repo, MCP server, or agent package safe to install? Run one scan and find out, before it touches your machine.**
 
 Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https://x.com/simchabrodsky))
 
-![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-335%20passing-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-335-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
-## What it does
+## The short version
 
-Be honest. When was the last time you actually read the code of an MCP server before wiring it into your agent? Or audited that handy GitHub repo before pasting its install command into your terminal? Almost nobody does. We clone, we install, we paste the setup line, and we hope.
+You are about to install something you did not write. A GitHub repo, an MCP server for your AI agent, a package with a one-line setup command. Be honest: you are not going to read all of its code first. Almost nobody does. We clone, we install, we paste the command, and we hope.
 
-That habit is the entire attack surface of modern AI tooling, and it is wide open. A poisoned CLAUDE.md that quietly redirects your assistant. A tool description with a hidden prompt injection. A dependency that exists for no reason except to run a malicious install hook. None of it looks dangerous until it is.
-
-Gatekeeper is the two-minute check you run first. Point it at a repo, an MCP server, an agent package, or a local folder, and it answers one question in plain language: is this safe to install, or not? You get a letter grade, the specific findings behind it, and enough context to make the call.
-
-Semgrep, CodeQL, and Snyk are excellent, but they answer "where are the bugs in my own code?" Gatekeeper answers a different question: "is this stranger's code safe to let into my system?" It is built for the AI-tooling attack surface those traditional scanners were never designed to see.
-
-Under the hood: pattern and AST detection across 16 languages, intra-function taint tracking that follows untrusted input to a dangerous sink, YARA signatures for known-bad payloads like webshells and miners, dependency CVE checks, and the AI-specific surface nobody else covers (CLAUDE.md poisoning, MCP schema poisoning, prompt injection in tool descriptions, phantom dependencies, evasion tricks built to beat regex scanners). One command, zero setup, a clear verdict at the end.
-
----
-
-## Quick Start
-
-Install it (pick one):
+Gatekeeper is the check you run in the two minutes before that. Point it at the thing, and it answers one question in plain English: **is this safe to install, or not?** You get a letter grade from A to F, the exact findings behind it, and enough context to make the call yourself.
 
 ```bash
-# Run on demand with uv, no install
 uvx --from gatekeeper-scanner gatekeeper https://github.com/user/repo
+```
+
+That is the whole idea. No account, no config, no setup. A grade in under a minute.
+
+## The longer version (for the security folks)
+
+Semgrep, CodeQL, and Snyk are excellent tools, but they answer "where are the bugs in code I own?" Gatekeeper answers a different question: "is this stranger's code safe to let into my system?" It is built for the AI-tooling attack surface those scanners were never designed to see: a poisoned `CLAUDE.md` that quietly redirects your assistant, a tool description with a hidden prompt injection, an MCP schema rigged to shadow a trusted tool, a dependency that exists for no reason except to run a malicious install hook.
+
+Under the hood, every scan runs:
+
+- Single-line and multi-line **pattern detection** across 16 languages, plus Dockerfiles, Kubernetes manifests, GitHub Actions, and AI config files.
+- **AST analysis** for Python: real parsing, not just regex, with import-alias resolution so `import os as o; o.system(x)` is still caught.
+- **Intra-function taint tracking** that follows untrusted input (request data, argv, env, decorated handler params) to a dangerous sink, with sanitizer awareness.
+- **YARA signatures** for known-bad payloads: webshells, reverse shells, cryptominers, droppers (optional engine).
+- **Dependency checks**: known CVEs via pip-audit or npm, an OSV.dev fallback when those are absent, plus typosquats, phantom dependencies, and lockfile drift.
+- The **AI and supply-chain surface** nobody else covers: MCP schema poisoning, prompt injection in tool descriptions, base-URL hijacking, install-hook abuse, and evasion tricks built specifically to beat regex scanners (string assembly, chr() chains, aliased imports, invisible Unicode).
+
+Then a **verification pass** downgrades the noise (test fixtures, vendored code, documentation, examples) so the grade reflects real risk, not raw pattern counts. On its own source Gatekeeper surfaces 52 findings and dismisses 452 as false positives, and grades itself A.
+
+---
+
+## Install
+
+```bash
+# Run on demand with uv, nothing installed
+uvx --from gatekeeper-scanner gatekeeper <target>
 
 # Or install it as a command
-pipx install gatekeeper-scanner      # isolated, recommended
-pip install gatekeeper-scanner       # plain pip
-pip install gatekeeper-scanner[all]  # plus optional YARA + pip-audit engines
+pipx install gatekeeper-scanner       # isolated, recommended
+pip install gatekeeper-scanner        # plain pip
+pip install gatekeeper-scanner[all]   # plus the optional YARA and pip-audit engines
 ```
 
-Scan something:
+Requires Python 3.9 or newer, and `git` for scanning remote repos. Nothing else. The optional engines (YARA signatures, pip-audit CVEs) are just that, optional; every other check runs without them.
 
-```bash
-gatekeeper https://github.com/user/repo         # a GitHub repo, before you install it
-gatekeeper https://github.com/user/repo#branch  # a specific branch
-gatekeeper /path/to/project                     # a local project or folder
-gatekeeper https://github.com/org/mcp-server    # an MCP server package
-```
-
-Or run straight from source, no install:
+Prefer to run from source with no install at all:
 
 ```bash
 git clone https://github.com/skyblueso/gatekeeper
-python3 gatekeeper/gatekeeper.py https://github.com/user/repo
+python3 gatekeeper/gatekeeper.py <target>
+```
+
+Everywhere below, `gatekeeper <target>` and `python3 gatekeeper.py <target>` are interchangeable.
+
+---
+
+## Scan something
+
+```bash
+gatekeeper https://github.com/user/repo         # a GitHub repo, before you install it
+gatekeeper https://gitlab.com/user/repo         # GitLab works too
+gatekeeper https://github.com/user/repo#branch  # a specific branch
+gatekeeper https://github.com/org/mcp-server    # an MCP server package
+gatekeeper /path/to/project                     # a local folder
+gatekeeper /path/to/file.py                     # a single file
+gatekeeper --self-scan                          # scan Gatekeeper's own source
 ```
 
 ---
 
-## Example Output
+## Example output
 
 ```
-$ python3 gatekeeper.py --self-scan
+$ gatekeeper --self-scan
 
-  Scanning: /path/to/security-scanner...
+  Scanning: /path/to/gatekeeper...
 
   Discovered 52 potential vulnerabilities. Investigating...
 
   ============================================================
     SECURITY SCAN REPORT
   ============================================================
-  Target:  /path/to/security-scanner
+  Target:  /path/to/gatekeeper
   Type:    local_dir
   Scan:    1.0s
   ------------------------------------------------------------
@@ -77,20 +99,12 @@ $ python3 gatekeeper.py --self-scan
   Languages:    Python (100%)
   Files:        12 source, 3 config, 29 total
   Lines:        9,686
-  Size:         520.0 KB
-  Detected:     SKILL.md, CI/CD
 
   DISCOVERY (52 potential vulnerabilities: 2 MEDIUM, 50 LOW)
-  451 detections dismissed as false positives.
+  452 detections dismissed as false positives.
 
    !   [FILESYSTEM] shutil.rmtree(): recursive directory deletion
        gatekeeper_scanner/core.py:370
-
-   !   [EXECUTION] compile(): compiles code for execution
-       gatekeeper_scanner/core.py:2275
-
-   !   [FILESYSTEM] shutil.rmtree(): recursive directory deletion
-       gatekeeper_scanner/core.py:2911
 
    .   [EXECUTION] eval(): executes arbitrary code (was HIGH)
        test_gatekeeper.py:91
@@ -98,199 +112,134 @@ $ python3 gatekeeper.py --self-scan
    .   [EXECUTION] subprocess with shell=True: command injection risk (was CRITICAL)
        test_gatekeeper.py:99
 
-    ... and 40 more findings (test-file detections, downgraded by context)
-
-  DEPENDENCIES (pip)
-  Total:        1
-  Vulnerabilities: 0
+    ... and more (mostly test-file detections, downgraded by context)
 
   RAW SCAN
   ████████████████████  A  SAFE
 
-  NEXT STEP
   [A] Clean. Safe to install.
-
-  LOW RISK
-  Minimal patterns detected. Context analysis likely to confirm safe.
 ```
 
-The scanner grades itself A. It contains the very patterns it detects, eval, exec, pickle, prompt injection strings: but the verification pass correctly identifies them as test fixtures, pattern definitions, and documentation references, downgrading them from CRITICAL/HIGH to LOW.
+Gatekeeper grades its own source A. It is a security scanner, so it is full of the exact patterns it hunts for: eval, exec, pickle, prompt-injection strings. The verification pass recognizes them as pattern definitions and test fixtures and downgrades them, which is the whole point. A scanner that cannot tell its own rules from a real payload is a scanner that cries wolf.
 
 ---
 
-## Requirements
-
-- Python 3.9+
-- `git` (for remote repo scanning)
-
-No other dependencies. Runs anywhere Python runs.
-
-**Optional: enables dependency CVE scanning:**
-- `pip-audit`: Python dependency CVEs
-- `npm`: Node.js dependency CVEs (uses `npm audit` internally)
-- When neither is installed, Gatekeeper falls back to the OSV.dev API for pinned packages instead of skipping CVE detection (disable with `--no-osv`).
-
-**Optional: enables YARA signature scanning:**
-- `yara-python`: fingerprints known webshells, cryptominers, reverse shells, and droppers. Install with `pip install gatekeeper-scanner[yara]` or `pip install yara-python`. Without it, every other check still runs. On the first interactive run, Gatekeeper offers to install it for you.
-
----
-
-## Usage
+## All the options
 
 ```bash
-# Scan a GitHub or GitLab repo
-python3 gatekeeper.py https://github.com/user/repo
-python3 gatekeeper.py https://gitlab.com/user/repo
+# Output formats
+gatekeeper <target> --json                 # machine-readable JSON
+gatekeeper <target> --sarif                 # SARIF v2.1.0 (GitHub Advanced Security, GitLab, VS Code)
+gatekeeper <target> --output report.json    # write the report to a path
+gatekeeper <target> --quiet                 # grade and exit code only (good for CI)
+gatekeeper <target> --verbose               # file-by-file progress and timing
+gatekeeper <target> --no-color              # plain text (auto-off when piped)
 
-# Scan a specific branch
-python3 gatekeeper.py https://github.com/user/repo#branch-name
+# Scope
+gatekeeper <target> --exclude "vendor/**,*.min.js,test/**"   # skip paths by glob
+gatekeeper <target> --diff main                              # only files changed since a ref
+gatekeeper <target> --max-files 100000                       # raise the file cap for huge repos
+gatekeeper <target> --timeout 120                            # scan timeout in seconds
 
-# Scan a local directory or single file
-python3 gatekeeper.py /path/to/project
-python3 gatekeeper.py /path/to/file.py
+# Engines (all on by default)
+gatekeeper <target> --skip-deps    # no dependency audit (offline or air-gapped)
+gatekeeper <target> --no-osv       # no OSV.dev network CVE fallback
+gatekeeper <target> --no-yara      # no YARA signature scanning
+gatekeeper <target> --no-taint     # no Python taint analysis
 
-# JSON output (for programmatic use or piping)
-python3 gatekeeper.py <target> --json
+# Gates and baselines
+gatekeeper <target> --policy "critical=0,high<=3"        # pass/fail thresholds for CI
+gatekeeper <target> --save-baseline baseline.json         # record current findings
+gatekeeper <target> --baseline baseline.json              # only report new findings
+gatekeeper <target> --disable-rules "GK-EXE-eval,GK-NET-raw-socket"
 
-# SARIF v2.1.0 output (GitHub Advanced Security, GitLab, VS Code)
-python3 gatekeeper.py <target> --sarif
+# Trust and private repos
+gatekeeper <target> --trust                # trust the target (enables its suppression config)
+gatekeeper <target> --token ghp_xxx        # scan a private repo (token scoped to the subprocess)
 
-# Skip dependency audit (offline/air-gapped environments)
-python3 gatekeeper.py <target> --skip-deps
-
-# Disable individual engines if needed
-python3 gatekeeper.py <target> --no-osv      # no OSV.dev network CVE fallback
-python3 gatekeeper.py <target> --no-yara     # no YARA signature scanning
-python3 gatekeeper.py <target> --no-taint    # no Python taint analysis
-
-# Exclude paths by glob pattern
-python3 gatekeeper.py <target> --exclude "vendor/**,*.min.js,test/**"
-
-# Save report to a specific path
-python3 gatekeeper.py <target> --output /path/to/report.json
-
-# Minimal output: grade and exit code only (for CI)
-python3 gatekeeper.py <target> --quiet
-
-# Verbose: file-by-file progress and timing
-python3 gatekeeper.py <target> --verbose
-
-# Set a scan timeout (seconds)
-python3 gatekeeper.py <target> --timeout 120
-
-# Baseline scanning: only report new findings
-python3 gatekeeper.py <target> --save-baseline baseline.json
-python3 gatekeeper.py <target> --baseline baseline.json
-
-# Policy-based pass/fail gate
-python3 gatekeeper.py <target> --policy "critical=0,high<=3"
-
-# Disable specific rules
-python3 gatekeeper.py <target> --disable-rules "GK-EXE-eval,GK-NET-raw-socket"
-
-# Scan private repos (token scoped to subprocess, not exported to env)
-python3 gatekeeper.py <target> --token ghp_yourtoken
-
-# Only scan files changed since a base ref (useful for CI PR review)
-python3 gatekeeper.py <target> --diff main
-
-# Disable color (auto-detected when stdout is not a TTY)
-python3 gatekeeper.py <target> --no-color
-
-# Raise the file cap for very large repos
-python3 gatekeeper.py <target> --max-files 100000
-
-# Trust the scan target (enables inline suppression, see Suppression)
-python3 gatekeeper.py <target> --trust
-
-# Verify Gatekeeper's own source code
-python3 gatekeeper.py --self-scan
-
-# Print version
-python3 gatekeeper.py --version
+# Info
+gatekeeper --self-scan
+gatekeeper --version
 ```
 
 ---
 
-## What It Scans
+## What it scans
 
-Every scan runs every check. No tiers, no configuration needed, no "deep mode" that you have to remember to enable.
+Every scan runs every check. No tiers, no "deep mode" to remember, no rules to write first.
 
-| Category | What It Catches |
+| Category | What it catches |
 |----------|-----------------|
-| **SECRET** | API keys, tokens, passwords, private keys, database connection strings, JWT tokens: AWS, GitHub, Anthropic, OpenAI, Stripe, Slack, GCP, Azure, Twilio, SendGrid, Telegram, and more |
-| **EXECUTION** | Shell execution, eval, dynamic code loading, dangerous deserialization, install hooks: across Python, JS/TS, Go, Rust, Java, Ruby, Shell, PHP, C/C++, C# |
-| **NETWORK** | Outbound HTTP calls, WebSocket connections, suspicious endpoints, data exfiltration patterns, tunneling services, SSL certificate validation bypasses |
-| **FILESYSTEM** | Sensitive path access, directory traversal, recursive deletion, symlink attacks, insecure temp files, permission modification |
-| **INJECTION** | Prompt injection in tool descriptions, CLAUDE.md/`.cursorrules` poisoning, SQL injection, NoSQL injection, XSS, SSRF, XXE, SSTI, prototype pollution, log injection, GitHub Actions command injection, C/C++ buffer overflow patterns |
-| **DEPENDENCY** | Known CVEs (pip-audit/npm-audit, with an OSV.dev network fallback when those tools are absent), typosquatting candidates, phantom dependencies (declared but never imported), lockfile drift between manifest and lock file, suspicious install scripts |
-| **PERMISSION** | Root containers, privilege escalation, Docker socket mounts, SYS_ADMIN capabilities, setuid bits |
-| **OBFUSCATION** | Base64/ROT-encoded payloads, string concatenation evasion (`'ev' + 'al'`), chr() chains, variable assembly, aliased imports, invisible Unicode characters, high-entropy strings, minified code, pre-compiled binaries |
-| **LICENSE** | Missing LICENSE file, restrictive licenses (AGPL, GPL) that may affect your distribution rights |
-| **MCP** | Tool shadowing, schema poisoning across parameter schemas/defaults/required fields (not just descriptions), rug pull indicators, config injection |
-| **CI/CD** | GitHub Actions untrusted input injection, `pull_request_target` privilege escalation, outdated action references |
-| **DOCKER** | Running as root, secrets in build args or ENV, curl-pipe-bash, privileged containers, socket mounts, host network mode |
-| **KUBERNETES** | Privileged pods, hostPath mounts, excessive RBAC permissions, missing security contexts |
-| **SIGNATURE** | YARA signature matches for known-bad content: PHP webshells, reverse shells (bash/nc/python), cryptominers, PowerShell download-and-execute, Python remote droppers, base64-embedded PE executables. Scans text and binary files. Optional (requires `yara-python`) |
-| **TAINT** | Intra-function data flow (Python): untrusted input (request data, `sys.argv`, `input()`, `os.environ`, decorated route/tool handler params) reaching a dangerous sink (`eval`/`exec`, `subprocess`, `os.system`, `pickle`/`yaml` deserialization, SQL `execute`, `open`, dynamic import, file deletion, SSRF). Sanitizers like `int()`, `shlex.quote`, `html.escape` clear taint |
+| **SECRET** | API keys, tokens, passwords, private keys, database URLs, JWTs: AWS, GitHub, Anthropic, OpenAI, Stripe, Slack, GCP, Azure, Twilio, SendGrid, Telegram, and more. Plus secrets committed and later deleted (git history, on local clones). |
+| **EXECUTION** | Shell execution, eval, dynamic code loading, unsafe deserialization, install hooks, across Python, JS/TS, Go, Rust, Java, Ruby, Shell, PHP, C/C++, C#. |
+| **NETWORK** | Outbound calls, WebSockets, suspicious endpoints, exfiltration patterns, tunneling services, TLS validation bypass. |
+| **FILESYSTEM** | Sensitive path access, directory traversal, recursive deletion, symlink attacks, insecure temp files, permission changes. |
+| **INJECTION** | Prompt injection in tool descriptions, `CLAUDE.md` and `.cursorrules` poisoning, SQL, NoSQL, XSS, SSRF, XXE, SSTI, prototype pollution, log injection, GitHub Actions command injection, C/C++ buffer patterns. |
+| **DEPENDENCY** | Known CVEs (pip-audit / npm, OSV.dev fallback), typosquats, phantom dependencies (declared, never imported), lockfile drift, suspicious install scripts. |
+| **PERMISSION** | Root containers, privilege escalation, Docker socket mounts, SYS_ADMIN capabilities, setuid. |
+| **OBFUSCATION** | Base64 and encoded payloads, string-concat evasion (`'ev' + 'al'`), chr() chains, variable assembly, aliased imports, invisible Unicode, high-entropy blobs, minified code, precompiled binaries. |
+| **MCP** | Tool shadowing, schema poisoning (parameters, defaults, required fields, not just descriptions), rug-pull indicators, config injection, base-URL hijacking. |
+| **CI/CD** | GitHub Actions untrusted-input injection, `pull_request_target` privilege escalation, stale action references. |
+| **DOCKER** | Root user, secrets in build args or ENV, curl-pipe-shell, privileged containers, socket mounts, host networking. |
+| **KUBERNETES** | Privileged pods, hostPath mounts, excessive RBAC, missing security contexts. |
+| **SIGNATURE** | YARA matches for known-bad content: PHP webshells, reverse shells, cryptominers, PowerShell download-and-run, Python droppers, base64-embedded executables. Optional (`yara-python`). |
+| **TAINT** | Python intra-function data flow: untrusted input reaching a dangerous sink, with two trust levels and sanitizer awareness. |
+| **LICENSE** | Missing LICENSE, restrictive licenses that may affect your distribution rights. |
 
-**Language coverage:** Python, JavaScript, TypeScript, Go, Rust, Java, Kotlin, Ruby, PHP, Swift, C, C++, C#, Lua, Perl, Shell, plus Dockerfile, Kubernetes YAML, GitHub Actions, and AI configuration files (CLAUDE.md, `.cursorrules`, Copilot instructions, Cursor configs).
+**Languages:** Python, JavaScript, TypeScript, Go, Rust, Java, Kotlin, Ruby, PHP, Swift, C, C++, C#, Lua, Perl, Shell, plus Dockerfile, Kubernetes YAML, GitHub Actions, and AI config files (`CLAUDE.md`, `.cursorrules`, Copilot and Cursor configs). Python, JS/TS, Go, Rust, Java, Ruby, PHP, and Shell have deep coverage; Swift, C/C++, Perl, Lua, and C# catch the common dangerous patterns but are not full audits.
 
-Note: Python, JavaScript/TypeScript, Go, Rust, Java, Ruby, PHP, and Shell have deep coverage. Swift, C/C++, Perl, Lua, and C# have foundational coverage: common patterns are caught, but these are not comprehensive audits.
-
-**CWE mapping:** 105 rule-to-CWE mappings across all categories. Every finding includes its CWE identifier in SARIF output and JSON reports.
+Every finding carries a stable rule ID (like `GK-EXE-eval`) and a CWE identifier in the JSON and SARIF output.
 
 ---
 
-## How It Works
+## How it works
 
-Gatekeeper runs a four-phase pipeline on every scan:
+Four phases, every scan:
 
-**Phase 1: Walk:** A single pass through the file tree categorizes every file by type (source, config, AI config, binary, Dockerfile, Kubernetes manifest, CI pipeline, etc.) and builds an index. The walk respects `.gitignore` conventions and skips standard noise directories (`node_modules`, `.git`, `__pycache__`, `vendor`, `dist`, etc.).
-
-**Phase 2: Detect:** All detection modules run against the categorized index in parallel. Single-line pattern matching, multi-line pattern matching (for vulnerabilities that span function calls), secret detection with entropy scoring, network behavior analysis, MCP schema inspection, dependency audit, binary detection, symlink analysis, obfuscation detection, aliased import tracing, and git history scanning on local repos.
-
-**Phase 3: Verify:** Every raw finding goes through a contextual verification pass before scoring. Findings in test files, vendor directories, documentation, example code, and fixture directories are downgraded: they're lower risk by context. This pass is the primary mechanism for false positive reduction without rules tuning.
-
-**Phase 4: Score:** Verified findings are weighted by severity (CRITICAL: 15, HIGH: 7, MEDIUM: 3, LOW: 1) and aggregated into a numerical score. The score maps to a letter grade via configurable bands.
+1. **Walk.** One pass over the file tree categorizes every file (source, config, AI config, binary, Dockerfile, Kubernetes, CI pipeline) and builds an index. It skips the usual noise (`node_modules`, `.git`, `__pycache__`, `vendor`, `dist`).
+2. **Detect.** All detection modules run against the index in parallel: single-line and multi-line patterns, entropy-scored secret detection, AST analysis, taint tracking, MCP schema inspection, dependency audit, obfuscation and aliased-import tracing, and git-history scanning on local clones.
+3. **Verify.** Every raw finding goes through a contextual pass before scoring. Findings in test files, vendored code, docs, and examples are downgraded by context. This is how Gatekeeper stays quiet without you tuning rules, and it dismisses roughly fifteen times more findings than it keeps.
+4. **Score.** Verified findings are weighted by severity and mapped to a letter grade.
 
 ---
 
-## Grading System
+## Grading
 
 | Grade | Verdict | Meaning |
 |-------|---------|---------|
 | **A** | INSTALL | Clean. No meaningful findings. |
 | **B** | INSTALL | Low risk. Minor findings worth noting, nothing blocking. |
-| **C** | REVIEW BEFORE INSTALLING | Contains patterns worth checking. Likely safe, but verify the specific findings against the tool's stated purpose. |
-| **D** | DO NOT INSTALL: VULNERABLE | Exploitable security holes. Sloppy code, hardcoded credentials, unsafe deserialization, exposed admin surfaces. Probably unintentional, still dangerous. |
-| **F** | DO NOT INSTALL | Critical vulnerabilities or malicious patterns. Data exfiltration, prompt injection targeting AI assistants, obfuscated backdoors, supply chain attacks. |
+| **C** | REVIEW FIRST | Patterns worth checking against the tool's stated purpose. Likely fine, but look. |
+| **D** | DO NOT INSTALL: VULNERABLE | Real holes: hardcoded credentials, unsafe deserialization, exposed admin surfaces. Probably careless, still dangerous. |
+| **F** | DO NOT INSTALL | Critical or malicious: data exfiltration, prompt injection targeting your AI assistant, obfuscated backdoors, supply-chain attacks. |
 
-**Exit codes for CI:** `0` for grades A/B/C, `1` for grades D/F. Override the threshold with `--policy` if you want stricter or looser gates.
+The line between D and F matters. A D was probably written by someone careless. An F may be trying to harm you.
 
-The distinction between D and F matters. A D-grade repo has dangerous holes, the developer was probably careless. An F-grade repo may be trying to harm you.
+**CI exit codes:** `0` for A/B/C, `1` for D/F. Change the gate with `--policy`.
 
 ---
 
-## Configuration
+## The trust model
 
-Drop a `.gatekeeper.json` file in your project root to configure project-level behavior. Gatekeeper only reads this file from trusted scan targets (local directories, or remote repos scanned with `--trust`). It is never read from an untrusted scan target, the config cannot be weaponized by a repo you're evaluating.
+This is the part that makes Gatekeeper safe to point at hostile code.
+
+A repo you are evaluating gets **zero say** over its own grade. Project config (`.gatekeeper.json`, `.gatekeeper-ignore`, inline `# gatekeeper: ignore` comments) is only read from a **trusted** target: a local folder, or a remote repo you explicitly scan with `--trust`. It is never read from an untrusted remote repo, so a malicious project cannot ship a config that silences its own findings.
+
+And even on a trusted target, suppression has a hard floor: it can quiet LOW and MEDIUM noise, but it can **never** hide a `CRITICAL`, `HIGH`, or `SECRET` finding, through any lever (config `suppress`, inline ignore, or `severity_weights`). When a target's config tries, the finding still surfaces and the attempt is reported. Files a target excludes from the scan are disclosed too, so nothing gets quietly dropped before it is looked at. A repo should never be able to talk Gatekeeper out of showing you something serious.
+
+### Configuration
+
+Drop a `.gatekeeper.json` in your own project root to tune Gatekeeper for it:
 
 ```json
 {
   "exclude": ["vendor/**", "tests/**", "*.min.js"],
-  "severity_weights": {
-    "CRITICAL": 15,
-    "HIGH": 7,
-    "MEDIUM": 3,
-    "LOW": 1,
-    "INFO": 0
-  },
+  "severity_weights": { "CRITICAL": 15, "HIGH": 7, "MEDIUM": 3, "LOW": 1, "INFO": 0 },
   "suppress": [
     {
       "rule": "GK-EXE-eval",
       "files": ["src/template-engine.py"],
-      "reason": "Eval is intentional: sandboxed template evaluation"
+      "reason": "Sandboxed template evaluation, intentional"
     }
   ],
   "custom_patterns": [
@@ -305,48 +254,30 @@ Drop a `.gatekeeper.json` file in your project root to configure project-level b
 }
 ```
 
-**`exclude`**: glob patterns to skip entirely during the walk phase.
+- **`exclude`**: globs to skip during the walk.
+- **`severity_weights`**: override default scoring (cannot lower CRITICAL/HIGH below their floor on a target you did not author).
+- **`suppress`**: silence specific findings by rule ID and path. A `reason` is required.
+- **`custom_patterns`**: add your own detection rules on top of the built-ins.
+- **`.gatekeeper-ignore`**: one glob per line (`#` for comments), merged with `--exclude`. Trusted targets only.
 
-**`severity_weights`**: override the default scoring weights if your risk model differs.
-
-**`suppress`**: suppress specific findings by rule ID and path. Requires a `reason`. Trust-gated: only active when Gatekeeper trusts the scan target.
-
-**`custom_patterns`**: add your own detection rules on top of the built-in set.
-
-**`.gatekeeper-ignore`**: Drop a `.gatekeeper-ignore` file in your project root (one glob pattern per line, `#` for comments). Patterns are merged with `--exclude`. Only honored for trusted scan targets.
-
----
-
-## Suppression
-
-Two suppression mechanisms exist. Both are trust-gated: they only work when Gatekeeper trusts the scan target. They have no effect when scanning an untrusted remote repo, which prevents a malicious repo from suppressing its own findings.
-
-Even on a trusted target, suppression has a hard floor: it can quiet LOW and MEDIUM noise, but it can **never** hide a `CRITICAL`, `HIGH`, or `SECRET` finding, no matter which lever is used (config `suppress`, inline `# gatekeeper: ignore`, or `severity_weights`). When a target's config tries to silence one of those, the finding still surfaces and the attempt is reported. Files a target's own config excludes from the scan are disclosed too, so nothing can be quietly dropped before it is even looked at. The idea is simple: a repo you are evaluating should never be able to talk Gatekeeper out of showing you something serious.
-
-**Inline suppression**: add a comment on the line with the finding:
+### Inline suppression
 
 ```python
 secret_key = load_from_vault()  # gatekeeper: ignore
 ```
-
 ```javascript
 exec(command, options)  // gatekeeper: ignore
 ```
 
-```yaml
-privileged: true  # gatekeeper: ignore
-```
-
-**Config suppression**: suppress by rule ID and path in `.gatekeeper.json` (shown above). This is preferred for anything you're suppressing intentionally across an entire file, since it keeps the reason documented.
+Trust-gated, and still bound by the CRITICAL/HIGH/SECRET floor above.
 
 ---
 
-## CI/CD Integration
+## CI/CD
 
 ```yaml
 # .github/workflows/security.yml
 name: Gatekeeper Security Scan
-
 on: [push, pull_request]
 
 jobs:
@@ -354,19 +285,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Clone Gatekeeper
-        run: |
-          git clone https://github.com/skyblueso/gatekeeper /tmp/gatekeeper
-          cd /tmp/gatekeeper && git checkout v1.2.0  # Pin to a release tag
+      - name: Install Gatekeeper
+        run: pip install gatekeeper-scanner
 
-      - name: Run Gatekeeper
-        run: python3 /tmp/gatekeeper/gatekeeper.py . --sarif --output results.sarif
+      - name: Scan
+        run: gatekeeper . --sarif --output results.sarif
         continue-on-error: true
 
       - name: Upload to GitHub Advanced Security
@@ -375,141 +302,87 @@ jobs:
           sarif_file: results.sarif
 ```
 
-**Baseline scanning**: scan once to establish a baseline, then only report new findings in subsequent runs:
+**Baselines**, to only report new findings:
 
 ```bash
-# First run: establish baseline
-python3 gatekeeper.py . --save-baseline .gatekeeper-baseline.json
-
-# Subsequent runs: only new findings
-python3 gatekeeper.py . --baseline .gatekeeper-baseline.json
+gatekeeper . --save-baseline .gatekeeper-baseline.json   # first run
+gatekeeper . --baseline .gatekeeper-baseline.json        # later runs
 ```
 
-**Policy gates**: fail CI on specific thresholds without being tied to letter grades:
+**Policy gates**, to fail on thresholds instead of a letter grade:
 
 ```bash
-# Fail on any critical, allow up to 3 high
-python3 gatekeeper.py . --policy "critical=0,high<=3"
+gatekeeper . --policy "critical=0,high<=3"
 ```
 
 ---
 
-## API Usage
-
-Gatekeeper exposes a `SecurityScanner` class for programmatic use:
-
-```python
-from gatekeeper_scanner import SecurityScanner
-
-# Instantiate with options
-scanner = SecurityScanner(
-    skip_deps=False,
-    exclude_patterns=["vendor/**", "tests/**"],
-    # config dict accepts same keys as .gatekeeper.json
-    config={
-        "severity_weights": {"CRITICAL": 20, "HIGH": 8, "MEDIUM": 2, "LOW": 1, "INFO": 0}
-    }
-)
-
-# Run a scan: accepts GitHub URL, GitLab URL, local path, or single file
-report = scanner.scan("https://github.com/user/repo")
-
-# Access results
-print(report.grade)          # "A", "B", "C", "D", "F", or "ERROR"
-print(report.score)          # Numerical score (0: 100)
-print(report.verdict)        # "INSTALL", "REVIEW BEFORE INSTALLING", "DO NOT INSTALL", etc.
-
-for finding in report.findings:
-    print(finding.category)  # "SECRET", "EXECUTION", "NETWORK", etc.
-    print(finding.severity)  # "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"
-    print(finding.message)   # Human-readable description
-    print(finding.file)      # Relative file path
-    print(finding.line)      # Line number
-    print(finding.rule_id)   # Stable rule ID (e.g. "GK-EXE-eval")
-    print(finding.cwe)       # CWE identifier (e.g. "CWE-95")
-    print(finding.snippet)   # Code context around the finding
-
-# Dependency report (if not skipped)
-if report.dependency_report:
-    print(report.dependency_report["audit_findings"])
-
-# Serialization
-import json
-print(json.dumps(report.to_dict(), indent=2, default=str))
-```
-
-**SARIF generation:**
+## Python API
 
 ```python
 from gatekeeper_scanner import SecurityScanner, generate_sarif
 import json
 
-scanner = SecurityScanner()
-report = scanner.scan("/path/to/project")
-sarif = generate_sarif(report)
-print(json.dumps(sarif, indent=2))
+scanner = SecurityScanner(
+    skip_deps=False,
+    exclude_patterns=["vendor/**", "tests/**"],
+    config={"severity_weights": {"CRITICAL": 20, "HIGH": 8, "MEDIUM": 2, "LOW": 1, "INFO": 0}},
+)
+
+# Accepts a GitHub or GitLab URL, a local path, or a single file
+report = scanner.scan("https://github.com/user/repo")
+
+print(report.grade)     # "A".."F", or "ERROR"
+print(report.score)     # 0 to 100
+print(report.verdict)   # "INSTALL", "REVIEW BEFORE INSTALLING", "DO NOT INSTALL", ...
+
+for f in report.findings:
+    print(f.category, f.severity, f.file, f.line, f.rule_id, f.cwe, f.message)
+
+# SARIF for CI dashboards
+print(json.dumps(generate_sarif(report), indent=2))
 ```
 
 ---
 
-## Known Limitations
+## How it compares
 
-Be honest with yourself about what this tool is and isn't.
+**vs. Semgrep / CodeQL.** Both do full inter-procedural taint tracking and deep data flow, and they are more powerful on complex control flow. They also need language-specific rules, language servers, and setup to get value. Gatekeeper needs nothing: run it against any repo in any language and get a grade in under a minute. Its taint pass is intra-function only, a lighter pass aimed at pre-install triage, not exhaustive review. For triaging unknown code, Gatekeeper wins on speed and breadth. For auditing your own codebase, reach for Semgrep or CodeQL.
 
-**Taint tracking is intra-function only.** Gatekeeper now follows untrusted input from a source to a dangerous sink WITHIN a single Python function (see the TAINT category), with two trust levels and sanitizer awareness. It does NOT follow a tainted value ACROSS function call boundaries or module imports. If a dangerous value originates in one function or file and gets executed in another, Gatekeeper will not connect those dots. Semgrep and CodeQL do full inter-procedural data flow; Gatekeeper does not. For pre-install triage the intra-function pass catches the common cases. For in-production review of complex control flow, use a full taint-tracking tool.
+**vs. Snyk.** Snyk is mainly a dependency CVE scanner with great IDE integration. It does not read code patterns, AI config files, MCP schemas, or supply-chain install-hook tricks. The overlap is dependency scanning, where Gatekeeper uses pip-audit and npm under the hood to cover the same ground.
 
-**Shallow clones for remote repos.** When scanning a remote URL, Gatekeeper clones shallowly for speed. Git history scanning (catching secrets that were committed and later deleted) only works on full local clones. If you need history scanning on a remote repo, clone it first and scan the local path.
-
-**Phantom dependency false positives.** Dynamic plugin architectures that resolve package names at runtime (configuration-driven plugin loaders, extension systems) may appear to have phantom dependencies, the import never appears in source code, but it's intentional. These will produce false positives that you'll need to suppress.
-
-**Basic Perl coverage.** Detection covers the common dangerous functions (`system`, `exec`, `eval`, backticks, open pipes) but Perl's flexibility means coverage is shallower than other languages. More patterns are planned.
-
-**Foundational Lua and C# coverage.** Detection covers common dangerous patterns but is not comprehensive. More patterns are planned.
-
-**Modular architecture.** The scanner spans the `gatekeeper_scanner` package: `core.py`, `ast_scanner.py`, `patterns.py`, `models.py`, `reporter.py`, plus the optional engine modules `taint.py`, `yara_engine.py` (with `yara_rules/`), and `osv.py`.
-
-**`--timeout` cross-platform support.** A `threading.Timer` fallback is used on Windows when `SIGALRM` is unavailable. For CI on Windows, external timeout mechanisms (e.g., GitHub Actions `timeout-minutes`) also work.
-
-**Private repo tokens.** When using `--token`, the PAT is scoped to the git subprocess environment and never exported globally. However, it is visible in the cloned repo's git config until the temp directory is cleaned up at scan completion.
+**What only Gatekeeper covers:** the MCP and AI attack surface. Prompt injection in tool descriptions and parameter schemas. `CLAUDE.md` poisoning aimed at Claude Code users. Config attacks on Cursor and Copilot. Phantom dependencies that exist purely to run a malicious install hook. Evasion built specifically to beat regex detection. No commercial scanner covers this, because the surface barely existed until recently. That is what Gatekeeper was built for.
 
 ---
 
-## How It Compares
+## Known limitations
 
-**vs. Semgrep / CodeQL**
+Be honest with yourself about what this is and is not.
 
-Both are AST-based with full inter-procedural taint tracking and deep data flow analysis, significantly more powerful for complex control flow. Gatekeeper's taint analysis is intra-function only, a lighter pass aimed at pre-install triage rather than exhaustive review. The trade-off is setup: both require language-specific rules, language servers, and configuration to get value. Semgrep is faster to configure than CodeQL but still requires you to know what you're looking for. Gatekeeper requires nothing: run it against any repo in any language and get a grade in under 60 seconds. For pre-install triage of unknown code, Gatekeeper wins on speed and coverage breadth. For production security review of your own codebase, Semgrep/CodeQL are the right tools.
-
-**vs. Snyk**
-
-Snyk is primarily a dependency CVE scanner with IDE integration. It's excellent at what it does: tracking known vulnerabilities in your dependency tree, integrated into a development workflow. It does not scan code patterns, AI configuration files, MCP schemas, supply chain indicators in install hooks, or anything in the AI-specific attack surface. The use cases overlap only on the dependency scanning component, where Gatekeeper uses pip-audit and npm-audit under the hood to cover the same ground.
-
-**Gatekeeper's unique coverage:** MCP and AI-specific attack surface. Prompt injection in tool descriptions and parameter schemas. CLAUDE.md poisoning designed to compromise Claude Code users. Config file attacks targeting Cursor, Copilot, and other AI coding assistants. Phantom dependencies that exist purely for malicious install hooks. String concatenation evasion specifically designed to defeat regex-based detection. No commercial scanner covers this attack surface because it didn't exist until recently. Gatekeeper was built specifically for it.
+- **Taint is intra-function only.** It follows untrusted input to a sink within one Python function. It does not track a tainted value across functions, files, or imports. Semgrep and CodeQL do; Gatekeeper does not. Good enough for pre-install triage, not a substitute for full data-flow review.
+- **Remote scans are shallow clones.** Fast, but git-history secret scanning (finding secrets that were committed then deleted) only runs on full local clones. Clone it yourself and scan the path if you need history.
+- **Phantom-dependency false positives.** Runtime plugin loaders that resolve package names dynamically can look like phantom deps. Suppress those.
+- **Foundational coverage for Swift, C/C++, Perl, Lua, C#.** Common dangerous patterns are caught; these are not comprehensive audits yet.
+- **`--token` visibility.** A private-repo PAT is scoped to the git subprocess, not exported globally, but it lives in the cloned repo's git config until the temp directory is cleaned up at scan end.
 
 ---
 
-## What's Next
+## Roadmap
 
-Development is ongoing. This is very early stage and I hope to continue improvements regularly as new bugs are discovered, or gaps are found that can be filled with new scan modules. When a detection gap is discovered, it gets patched and the update will push live to everyone.
+Early stage and improving regularly. When a detection gap is found, it gets patched. Planned next:
 
-Planned for v2:
+- More language depth (Perl, and new targets like R, Zig, and Move for Sui/Aptos smart contracts), and deeper C/C++.
+- Better machine-readable output for SIEM and dashboards.
+- More AI-specific patterns as MCP poisoning and agent prompt-injection techniques get documented.
+- Full git-history scanning for remote repos, not just local clones.
 
-- **Additional language coverage.** Expanding Perl patterns significantly. Adding R, Zig, and Move (Sui/Aptos smart contracts). Deepening C/C++ coverage beyond the current buffer overflow and command injection patterns.
-- **Structured logging improvements.** Better machine-readable output for integration with SIEM systems and security dashboards.
-- **More AI-specific patterns.** The AI agent attack surface is evolving quickly. New MCP poisoning vectors, agent prompt injection techniques, and model-specific attack patterns will be added as they're documented.
-- **Full git history scanning for remote repos.** Currently limited to local clones. Remote history scanning is architecturally complex but the value is real, many credential leaks are in deleted commits.
-
-If you want to help take this further and contribute to something meaningful in the AI/agentic space, improving detection patterns, adding new languages, or improving the architecture: I would love to see this become an open-source project that makes it to enterprise level doing something not yet on the market. Reach out on X: [@simchabrodsky](https://x.com/simchabrodsky).
+If you want to help build something genuinely new in the AI and agentic security space, detection patterns, new languages, architecture, I would love the help. Reach out on X: [@simchabrodsky](https://x.com/simchabrodsky).
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-For bugs, feature requests, and everything else: [@simchabrodsky](https://x.com/simchabrodsky) on X/Twitter.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md). For bugs, ideas, and everything else: [@simchabrodsky](https://x.com/simchabrodsky).
 
 ## License
 
