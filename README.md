@@ -26,22 +26,32 @@ Under the hood: pattern and AST detection across 16 languages, intra-function ta
 
 ## Quick Start
 
+Install it (pick one):
+
 ```bash
-# Clone
+# Run on demand with uv, no install
+uvx --from gatekeeper-scanner gatekeeper https://github.com/user/repo
+
+# Or install it as a command
+pipx install gatekeeper-scanner      # isolated, recommended
+pip install gatekeeper-scanner       # plain pip
+pip install gatekeeper-scanner[all]  # plus optional YARA + pip-audit engines
+```
+
+Scan something:
+
+```bash
+gatekeeper https://github.com/user/repo         # a GitHub repo, before you install it
+gatekeeper https://github.com/user/repo#branch  # a specific branch
+gatekeeper /path/to/project                     # a local project or folder
+gatekeeper https://github.com/org/mcp-server    # an MCP server package
+```
+
+Or run straight from source, no install:
+
+```bash
 git clone https://github.com/skyblueso/gatekeeper
-cd gatekeeper
-
-# Scan a GitHub repo before installing it
-python3 gatekeeper.py https://github.com/user/repo
-
-# Scan a specific branch
-python3 gatekeeper.py https://github.com/user/repo#branch-name
-
-# Scan a local project
-python3 gatekeeper.py /path/to/project
-
-# Scan an MCP server package
-python3 gatekeeper.py https://github.com/org/mcp-server
+python3 gatekeeper/gatekeeper.py https://github.com/user/repo
 ```
 
 ---
