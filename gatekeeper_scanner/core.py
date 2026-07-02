@@ -36,9 +36,12 @@ from datetime import datetime
 logger = logging.getLogger("gatekeeper")
 
 try:
-    import tomllib
+    import tomllib          # Python 3.11+ stdlib
 except ImportError:
-    tomllib = None
+    try:
+        import tomli as tomllib   # opportunistic backport if the user has it (3.9/3.10)
+    except ImportError:
+        tomllib = None       # no TOML parser: pyproject.toml parsing is skipped, never fatal
 
 # Canonical imports from extracted modules
 from gatekeeper_scanner.patterns import (  # noqa: F401 — re-exports for test compatibility

@@ -3380,6 +3380,9 @@ class TestPhantomDepAttribution(unittest.TestCase):
             ("requirements.txt", "Phantom dependency: 'pyfoo' declared but never imported"),
         ])
 
+    @unittest.skipUnless(
+        __import__("gatekeeper_scanner.core", fromlist=["tomllib"]).tomllib is not None,
+        "pyproject.toml parsing needs a TOML reader (stdlib tomllib on Python 3.11+, or tomli)")
     def test_pyproject_phantom_attributed_to_pyproject(self):
         report = self._scan({
             "pyproject.toml": '[project]\nname = "x"\nversion = "1.0.0"\ndependencies = ["pybaz"]\n',
