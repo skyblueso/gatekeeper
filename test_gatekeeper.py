@@ -3930,6 +3930,101 @@ class TestCodexP2(unittest.TestCase):
 
 
 # ============================================================================
+# MCP Capability Audit
+# ============================================================================
+
+class TestMCPCapabilityAudit(unittest.TestCase):
+    """Files that DEFINE MCP tools get a capability audit: what do the tool
+    handlers grant the connected model? Clients and non-MCP code never trigger."""
+
+    def _mcp_findings(self, report):
+        return [f for f in report.findings
+                if f.verified and f.rule_id.startswith("GK-MCP-cap-")]
+
+    def test_python_fastmcp_exec(self):
+        r = scan_repo({"server.py": (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "import subprocess\n"
+            "mcp = FastMCP('demo')\n"
+            "@mcp.tool()\n"
+            "def run(cmd: str) -> str:\n"
+            "    return subprocess.run(cmd, shell=True, capture_output=True).stdout\n"
+        )})
+        caps = self._mcp_findings(r)
+        self.assertTrue(any(f.rule_id == "GK-MCP-cap-exec" and f.severity == "HIGH" for f in caps),
+                        f"expected exec capability finding, got {[f.rule_id for f in caps]}")
+        manifest = r.structure.get("mcp_capabilities", [])
+        self.assertTrue(any(c["capability"] == "process execution" for c in manifest))
+
+    def test_ts_mcpserver_child_process(self):
+        r = scan_repo({"server.ts": (
+            "import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';\n"
+            "import { execSync } from 'child_process';\n"
+            "const server = new McpServer({ name: 'demo' });\n"
+            "server.tool('run', async ({ cmd }) => execSync(cmd));\n"
+        )})
+        self.assertTrue(any(f.rule_id == "GK-MCP-cap-exec" for f in self._mcp_findings(r)))
+
+    def test_rust_rmcp_command(self):
+        r = scan_repo({"exec.rs": (
+            "use rmcp::Json;\n"
+            "use tokio::process::Command;\n"
+            "#[rmcp::tool(name = \"exec_spawn\")]\n"
+            "async fn spawn(program: String) -> Result<Json<String>, String> {\n"
+            "    let child = Command::new(program).spawn();\n"
+            "    Ok(Json(String::new()))\n"
+            "}\n"
+        )})
+        self.assertTrue(any(f.rule_id == "GK-MCP-cap-exec" for f in self._mcp_findings(r)))
+
+    def test_mcp_client_not_flagged(self):
+        # Imports the SDK but never registers a tool: a client, not a server.
+        r = scan_repo({"client.ts": (
+            "import { Client } from '@modelcontextprotocol/sdk/client/index.js';\n"
+            "const data = await fetch('https://api.example.com');\n"
+        )})
+        self.assertEqual(self._mcp_findings(r), [])
+        self.assertNotIn("mcp_capabilities", r.structure)
+
+    def test_non_mcp_subprocess_not_flagged(self):
+        r = scan_repo({"util.py": (
+            "import subprocess\n"
+            "def run(cmd):\n"
+            "    return subprocess.run(cmd)\n"
+        )})
+        self.assertEqual(self._mcp_findings(r), [])
+
+    def test_manifest_in_report_dict(self):
+        r = scan_repo({"server.py": (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "import os\n"
+            "mcp = FastMCP('demo')\n"
+            "@mcp.tool()\n"
+            "def env(name: str) -> str:\n"
+            "    return os.environ[name]\n"
+        )})
+        d = r.to_dict()
+        caps = d["structure"].get("mcp_capabilities", [])
+        self.assertTrue(any(c["capability"] == "environment variable access" for c in caps))
+        self.assertTrue(all(c["files"] for c in caps))
+
+    def test_one_finding_per_file_per_capability(self):
+        r = scan_repo({"server.py": (
+            "from mcp.server.fastmcp import FastMCP\n"
+            "import subprocess\n"
+            "mcp = FastMCP('demo')\n"
+            "@mcp.tool()\n"
+            "def a(cmd: str):\n"
+            "    subprocess.run(cmd)\n"
+            "@mcp.tool()\n"
+            "def b(cmd: str):\n"
+            "    subprocess.run(cmd)\n"
+        )})
+        execs = [f for f in self._mcp_findings(r) if f.rule_id == "GK-MCP-cap-exec"]
+        self.assertEqual(len(execs), 1)
+
+
+# ============================================================================
 # Run
 # ============================================================================
 

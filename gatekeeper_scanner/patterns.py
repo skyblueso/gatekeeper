@@ -336,6 +336,66 @@ MCP_INJECTION_PATTERNS = [
     (r"(?i)(?:ANTHROPIC_BASE_URL|OPENAI_BASE_URL)\s*[=:]\s*['\"]https?://(?!api\.anthropic\.com|api\.openai\.com)", "INJECTION", "CRITICAL", "API base URL set to non-official endpoint — traffic hijacking"),
 ]
 
+# MCP capability audit — which files DEFINE MCP tools, and what those tools
+# can do on the host. A file counts as tool-defining only when BOTH a framework
+# marker AND a tool-registration marker match, so MCP *clients* (SDK consumers
+# that never register tools) are not flagged.
+# Format: (extensions, framework_regex, registration_regex)
+MCP_TOOL_MARKERS = [
+    (frozenset({".py"}),
+     r"\bfrom\s+(?:fast)?mcp\b|\bimport\s+(?:fast)?mcp\b|\bFastMCP\s*\(",
+     r"@\w+(?:\.\w+)*\.tool\b|^\s*@tool\b"),
+    (frozenset({".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}),
+     r"@modelcontextprotocol/sdk|\bnew\s+McpServer\s*\(",
+     r"\.(?:tool|registerTool|addTool)\s*\(|\bCallToolRequestSchema\b"),
+    (frozenset({".rs"}),
+     r"\buse\s+rmcp\b|\brmcp::",
+     r"#\[\s*(?:rmcp::)?tool\b"),
+    (frozenset({".go"}),
+     r"mark3labs/mcp-go|metoro-io/mcp-golang",
+     r"\bmcp\.NewTool\s*\(|\.AddTool\s*\("),
+]
+
+# Capability sinks checked inside MCP tool-defining files. One finding per
+# (file, capability). These are disclosure, not automatically malicious —
+# context analysis judges intent. Format: (capability, regex, severity,
+# rule_id, message)
+MCP_CAPABILITY_SINKS = [
+    ("process execution",
+     r"\bsubprocess\.(?:run|call|Popen|check_output|check_call)\b|\bos\.system\s*\(|\bos\.popen\s*\(|\bpty\.spawn\b"
+     r"|\bchild_process\b|\bexecSync\s*\(|\bspawnSync?\s*\(|Command::new|std::process::Command|\bexec\.Command\s*\(",
+     "HIGH", "GK-MCP-cap-exec",
+     "MCP tool file grants process execution to the connected model"),
+    ("raw network access",
+     r"\bsocket\.socket\s*\(|TcpStream::connect|tokio::net::TcpStream|\bTcpListener\b"
+     r"|\bnet\.Dial\s*\(|net\.createConnection\s*\(|\bnew\s+WebSocket\s*\(",
+     "HIGH", "GK-MCP-cap-raw-net",
+     "MCP tool file grants raw network access to the connected model"),
+    ("file deletion",
+     r"\bos\.remove\s*\(|\bos\.unlink\s*\(|\bshutil\.rmtree\b|\bfs\.(?:unlink|rm|rmdir)(?:Sync)?\s*\("
+     r"|\bremove_file\b|\bremove_dir_all\b|\bos\.RemoveAll\s*\(|\brimraf\b",
+     "HIGH", "GK-MCP-cap-file-delete",
+     "MCP tool file grants file deletion to the connected model"),
+    ("executable file creation",
+     r"\bset_permissions\b|\bPermissionsExt\b|\bos\.chmod\s*\(|\bfs\.chmod(?:Sync)?\s*\(|\bos\.Chmod\s*\(",
+     "HIGH", "GK-MCP-cap-exec-write",
+     "MCP tool file grants executable file creation to the connected model"),
+    ("file write",
+     r"\bopen\s*\([^)]{0,80}['\"](?:w|a|wb|ab|w\+|a\+)['\"]|\bfs\.(?:writeFile|appendFile)(?:Sync)?\s*\("
+     r"|File::create|OpenOptions::new|\bos\.WriteFile\s*\(|\bioutil\.WriteFile\s*\(|\.write_text\s*\(|\.write_bytes\s*\(",
+     "MEDIUM", "GK-MCP-cap-file-write",
+     "MCP tool file grants file write to the connected model"),
+    ("outbound HTTP",
+     r"\brequests\.(?:get|post|put|delete|patch|head|request)\s*\(|\bhttpx\.|\burllib\.request\b"
+     r"|\bfetch\s*\(|\baxios\b|\breqwest\b|\bhttp\.(?:Get|Post)\s*\(",
+     "MEDIUM", "GK-MCP-cap-http",
+     "MCP tool file grants outbound HTTP to the connected model"),
+    ("environment variable access",
+     r"\bos\.environ\b|\bos\.getenv\s*\(|\bprocess\.env\b|\benv::var\b|\bstd::env\b|\bos\.Getenv\s*\(",
+     "MEDIUM", "GK-MCP-cap-env",
+     "MCP tool file grants environment variable access to the connected model"),
+]
+
 AI_CONFIG_INJECTION_PATTERNS = [
     (r"(?i)(?:curl|wget)\s+https?://", "INJECTION", "CRITICAL", "External URL fetch in AI config — data exfiltration risk"),
     (r"(?i)(?:ssh|scp|rsync)\s+\S+@", "INJECTION", "HIGH", "SSH/SCP command targeting remote host in AI config"),
@@ -452,6 +512,7 @@ __all__ = [
     "DANGEROUS_SWIFT", "DANGEROUS_C_CPP", "DANGEROUS_LUA", "DANGEROUS_PERL",
     "DANGEROUS_CSHARP",
     "K8S_PATTERNS", "MCP_INJECTION_PATTERNS", "AI_CONFIG_INJECTION_PATTERNS",
+    "MCP_TOOL_MARKERS", "MCP_CAPABILITY_SINKS",
     "DOCKERFILE_PATTERNS", "DOCKER_COMPOSE_PATTERNS",
     "GITHUB_ACTIONS_PATTERNS", "MAKEFILE_PATTERNS",
     "SUSPICIOUS_URLS", "SUSPICIOUS_PACKAGES_PY", "SUSPICIOUS_PACKAGES_JS",

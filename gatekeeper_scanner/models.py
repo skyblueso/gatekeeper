@@ -116,6 +116,13 @@ CWE_MAP = {
     # MCP
     "GK-MCP-schema-poisoning": "CWE-77",
     "GK-MCP-mcp-server": "CWE-77",
+    "GK-MCP-cap-exec": "CWE-78",
+    "GK-MCP-cap-raw-net": "CWE-918",
+    "GK-MCP-cap-file-delete": "CWE-459",
+    "GK-MCP-cap-exec-write": "CWE-732",
+    "GK-MCP-cap-file-write": "CWE-73",
+    "GK-MCP-cap-http": "CWE-918",
+    "GK-MCP-cap-env": "CWE-526",
     # C#
     "GK-EXE-process-start": "CWE-78",
     "GK-INJ-sqlcommand-with-string-concat": "CWE-89",

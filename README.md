@@ -6,7 +6,7 @@
 
 Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https://x.com/simchabrodsky))
 
-![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-335-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-342-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
@@ -34,8 +34,9 @@ Under the hood, every scan runs:
 - **YARA signatures** for known-bad payloads: webshells, reverse shells, cryptominers, droppers (optional engine).
 - **Dependency checks**: known CVEs via pip-audit or npm, an OSV.dev fallback when those are absent, plus typosquats, phantom dependencies, and lockfile drift.
 - The **AI and supply-chain surface** nobody else covers: MCP schema poisoning, prompt injection in tool descriptions, base-URL hijacking, install-hook abuse, and evasion tricks built specifically to beat regex scanners (string assembly, chr() chains, aliased imports, invisible Unicode).
+- An **MCP capability audit**: when a package defines MCP tools (FastMCP, the TypeScript SDK, rmcp, mcp-go), Gatekeeper checks what those tool handlers can actually do on your machine and prints a plain-English manifest: "this package's MCP tools grant the connected model: process execution, raw network access, file write." Injection scanners look for poisoned words; this looks at granted power.
 
-Then a **verification pass** downgrades the noise (test fixtures, vendored code, documentation, examples) so the grade reflects real risk, not raw pattern counts. On its own source Gatekeeper surfaces 52 findings and dismisses 452 as false positives, and grades itself A.
+Then a **verification pass** downgrades the noise (test fixtures, vendored code, documentation, examples) so the grade reflects real risk, not raw pattern counts. On its own source Gatekeeper surfaces 60 findings and dismisses 453 as false positives, and grades itself A.
 
 ---
 
@@ -85,23 +86,23 @@ $ gatekeeper --self-scan
 
   Scanning: /path/to/gatekeeper...
 
-  Discovered 52 potential vulnerabilities. Investigating...
+  Discovered 60 potential vulnerabilities. Investigating...
 
   ============================================================
     SECURITY SCAN REPORT
   ============================================================
   Target:  /path/to/gatekeeper
   Type:    local_dir
-  Scan:    1.0s
+  Scan:    1.3s
   ------------------------------------------------------------
 
   STRUCTURE
   Languages:    Python (100%)
-  Files:        12 source, 3 config, 29 total
-  Lines:        9,686
+  Files:        13 source, 5 config, 40 total
+  Lines:        10,262
 
-  DISCOVERY (52 potential vulnerabilities: 2 MEDIUM, 50 LOW)
-  452 detections dismissed as false positives.
+  DISCOVERY (60 potential vulnerabilities: 2 MEDIUM, 58 LOW)
+  453 detections dismissed as false positives.
 
    !   [FILESYSTEM] shutil.rmtree(): recursive directory deletion
        gatekeeper_scanner/core.py:370
@@ -178,7 +179,7 @@ Every scan runs every check. No tiers, no "deep mode" to remember, no rules to w
 | **DEPENDENCY** | Known CVEs (pip-audit / npm, OSV.dev fallback), typosquats, phantom dependencies (declared, never imported), lockfile drift, suspicious install scripts. |
 | **PERMISSION** | Root containers, privilege escalation, Docker socket mounts, SYS_ADMIN capabilities, setuid. |
 | **OBFUSCATION** | Base64 and encoded payloads, string-concat evasion (`'ev' + 'al'`), chr() chains, variable assembly, aliased imports, invisible Unicode, high-entropy blobs, minified code, precompiled binaries. |
-| **MCP** | Tool shadowing, schema poisoning (parameters, defaults, required fields, not just descriptions), rug-pull indicators, config injection, base-URL hijacking. |
+| **MCP** | Tool shadowing, schema poisoning (parameters, defaults, required fields, not just descriptions), rug-pull indicators, config injection, base-URL hijacking. Plus a capability audit: files that define MCP tools (FastMCP, TypeScript SDK, rmcp, mcp-go) are checked for what their handlers grant the connected model (process execution, raw network access, file deletion, executable creation, file write, outbound HTTP, environment access) and the report prints a capability manifest. |
 | **CI/CD** | GitHub Actions untrusted-input injection, `pull_request_target` privilege escalation, stale action references. |
 | **DOCKER** | Root user, secrets in build args or ENV, curl-pipe-shell, privileged containers, socket mounts, host networking. |
 | **KUBERNETES** | Privileged pods, hostPath mounts, excessive RBAC, missing security contexts. |

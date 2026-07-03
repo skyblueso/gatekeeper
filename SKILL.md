@@ -3,7 +3,7 @@ name: security-scanner
 description: Gatekeeper security scanner. Scan a repo, skill, or agent for risks before installing or running it.
 ---
 
-# Gatekeeper v1.2.0
+# Gatekeeper v1.4.0
 
 | name | description |
 | --- | --- |
@@ -127,6 +127,8 @@ Start with CRITICAL and HIGH, then work through MEDIUM and LOW. This is where th
 5. **Did the scanner miss anything?** Look at the dismissed findings count. If hundreds were dismissed, spot-check whether the verification pass was too aggressive. Check if MEDIUM/LOW findings were downgraded from CRITICAL/HIGH, read the `original_severity` field. A downgraded finding is still a finding. If something was downgraded and you disagree with the downgrade, flag it.
 
 6. **Are there patterns the scanner can't see?** The scanner uses regex, AST, YARA signatures, and intra-function taint tracking. The taint engine follows untrusted input to a dangerous sink WITHIN a single function, but it does NOT follow data flow ACROSS functions or files, and it does not evaluate runtime behavior. If you see a function that takes user input in file A and passes it to eval() in file B, the scanner won't connect those dots. You can. Flag cross-function and cross-file risks the scanner missed.
+
+7. **Read the MCP CAPABILITY MANIFEST as disclosure, not as a verdict.** When the report prints a manifest ("This package's MCP tools grant the connected model: process execution, raw network access, ..."), the target defines MCP tools and those are the host capabilities its handlers reach. Granted capabilities are not automatically malicious: a shell-runner MCP server grants exec BY DESIGN. Your job is to answer two questions for the user in plain language. First, does the granted power match the tool's stated purpose? A note-taking MCP server granting raw TCP is a red flag; a deployment tool granting exec is expected. Second, does the user understand that installing this hands those capabilities to whatever model connects to it, including a model processing attacker-controlled content? Always restate the manifest in the verdict for any MCP server, even at grade A.
 
 ### Phase 3: Second verification pass (MANDATORY for ALL scans)
 

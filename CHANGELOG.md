@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.4.0] - 2026-07-03
+
+Feature release: MCP capability audit. Came out of scanning Google's sec-gemini repo, whose Rust CLI hands the remote model arbitrary process execution, raw TCP, and executable file write through MCP local tools, and the scanner had nothing to say about it. Injection checks look for poisoned words; this release adds the other half: what power an MCP server actually grants the model that connects to it. Test suite grew from 335 to 342, all passing; self-scan stays grade A.
+
+### Added
+- **MCP capability audit.** New `GK-MCP-cap-*` rules. Files that define MCP tools are identified per ecosystem (Python FastMCP decorators, the TypeScript SDK's `McpServer`/`server.tool`, Rust `rmcp` tool macros, Go mcp-go) using a two-condition gate (framework marker AND tool-registration marker), so SDK *clients* never trigger. Tool-defining files are then checked for seven host capabilities their handlers grant the connected model: process execution (HIGH), raw network access (HIGH), file deletion (HIGH), executable file creation (HIGH), file write (MEDIUM), outbound HTTP (MEDIUM), and environment variable access (MEDIUM). One finding per file per capability, each with a stable rule ID and CWE.
+- **MCP capability manifest in the report.** When any capability is detected, the report prints a plain-English MCP CAPABILITY MANIFEST block ("This package's MCP tools grant the connected model: process execution — src/tool/exec.rs, ..."), and the same data lands in `structure.mcp_capabilities` in the JSON output. The manifest is disclosure and prints even when individual findings are downgraded by context: a legitimate MCP server may grant exec by design, and you should know that before you install it.
+
+### Changed
+- `--version` and the version constant are now `1.4.0`.
+
 ## [1.3.0] - 2026-07-02
 
 Security-hardening release. Two independent adversarial review passes drove a set of fixes to the verification and trust layers, closing real false negatives where the scanner could be talked out of reporting something it had actually found. No detection capability was removed; the scanner is harder to trick into staying quiet. Test suite grew from 297 to 335, all passing; self-scan stays grade A.

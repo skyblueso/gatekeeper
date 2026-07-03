@@ -183,6 +183,17 @@ class ReportPrinter:
 
     def _print_context(self, report: ScanReport):
         """Print context section \u2014 what the tool is and why it got the grade it got."""
+        mcp_caps = (report.structure or {}).get("mcp_capabilities") or []
+        if mcp_caps:
+            # Disclosure prints even when individual findings were downgraded.
+            print(f"\n  {self.BOLD}MCP CAPABILITY MANIFEST{self.RESET}")
+            print(f"  {self.DIM}This package's MCP tools grant the connected model:{self.RESET}")
+            for cap in mcp_caps:
+                files = ", ".join(cap["files"][:5])
+                if len(cap["files"]) > 5:
+                    files += f" (+{len(cap['files']) - 5} more)"
+                color = self.RED if cap["severity"] in ("CRITICAL", "HIGH") else self.YELLOW
+                print(f"    {color}{cap['capability']}{self.RESET} {self.DIM}\u2014 {files}{self.RESET}")
         if not report.tool_description and not report.grade_drivers:
             return
         print(f"\n  {self.BOLD}CONTEXT{self.RESET}")

@@ -52,6 +52,7 @@ from gatekeeper_scanner.patterns import (  # noqa: F401 — re-exports for test 
     DANGEROUS_SWIFT, DANGEROUS_C_CPP, DANGEROUS_LUA, DANGEROUS_PERL,
     DANGEROUS_CSHARP,
     K8S_PATTERNS, MCP_INJECTION_PATTERNS, AI_CONFIG_INJECTION_PATTERNS,
+    MCP_TOOL_MARKERS, MCP_CAPABILITY_SINKS,
     DOCKERFILE_PATTERNS, DOCKER_COMPOSE_PATTERNS,
     GITHUB_ACTIONS_PATTERNS, MAKEFILE_PATTERNS,
     SUSPICIOUS_URLS, SUSPICIOUS_PACKAGES_PY, SUSPICIOUS_PACKAGES_JS,
@@ -64,7 +65,7 @@ from gatekeeper_scanner.reporter import ReportPrinter, generate_sarif  # noqa: F
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
@@ -1161,6 +1162,51 @@ class SecurityScanner:
             self._scan_mcp_config(fpath, rel_path)
         for fpath, rel_path, ext in cats.source_files:
             self._scan_tool_descriptions(fpath, rel_path)
+        self._scan_mcp_tool_capabilities(cats)
+
+    def _is_mcp_tool_file(self, content: str, ext: str) -> bool:
+        """A file defines MCP tools only if BOTH a framework marker AND a
+        tool-registration marker match, so MCP clients are never flagged."""
+        for exts, framework_re, registration_re in MCP_TOOL_MARKERS:
+            if ext in exts and re.search(framework_re, content, re.MULTILINE) \
+                    and re.search(registration_re, content, re.MULTILINE):
+                return True
+        return False
+
+    def _scan_mcp_tool_capabilities(self, cats: CategorizedFiles):
+        """MCP capability audit: for every file that DEFINES MCP tools, report
+        which host capabilities the handlers grant the connected model, and
+        record a manifest in structure for the report CONTEXT section.
+
+        Findings are disclosure — a legitimate MCP server may grant exec by
+        design. Context analysis judges intent; the scanner's job is to make
+        the grant visible before install."""
+        mcp_exts = frozenset().union(*(exts for exts, _, _ in MCP_TOOL_MARKERS))
+        manifest = {}  # capability -> {"capability", "severity", "files"}
+        for fpath, rel_path, ext in cats.source_files:
+            if ext not in mcp_exts:
+                continue
+            content = self._read_file(fpath)
+            if content is None or not self._is_mcp_tool_file(content, ext):
+                continue
+            for capability, pattern, severity, rule_id, message in MCP_CAPABILITY_SINKS:
+                m = re.search(pattern, content)
+                if not m:
+                    continue
+                line_num = content[:m.start()].count("\n") + 1
+                self._add_finding(Finding(
+                    severity=severity, category="MCP", file=rel_path,
+                    line=line_num, message=message,
+                    snippet=m.group(0)[:100], rule_id=rule_id,
+                ))
+                entry = manifest.setdefault(capability, {
+                    "capability": capability, "severity": severity, "files": []})
+                entry["files"].append(rel_path)
+        if manifest:
+            sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+            cats.structure["mcp_capabilities"] = sorted(
+                manifest.values(),
+                key=lambda e: (sev_order.get(e["severity"], 9), e["capability"]))
 
     def _scan_file_for_injection(self, fpath: str, rel_path: str, patterns):
         content = self._read_file(fpath)
