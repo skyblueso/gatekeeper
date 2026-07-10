@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper Security Scanner v1.3.0
+Gatekeeper Security Scanner
 
 Full-stack security analysis for GitHub repos, MCP servers, AI agent packages,
 and local projects. One command. Every check. Every time.
@@ -65,7 +65,7 @@ from gatekeeper_scanner.reporter import ReportPrinter, generate_sarif  # noqa: F
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
@@ -2988,7 +2988,13 @@ class SecurityScanner:
                                       "playgrounds/", "benchmarks/", "bench/"))
         )
         is_infra = bool(_dirs & {".devcontainer", ".github", ".circleci", ".gitlab"})
-        is_reference = bool(_dirs & {"references", "reference", "hooks"})
+        # NOTE: `hooks` is deliberately NOT treated as reference/doc material.
+        # A `hooks/` directory (Claude Code event hooks, git hooks, package
+        # lifecycle) can hold code that executes at install/invocation time, so
+        # downgrading its findings would silence exactly the install-time threat
+        # this scanner exists to catch. A bare `hooks/` path is left neutral:
+        # detector severity stands, no downgrade and no path-based uplift.
+        is_reference = bool(_dirs & {"references", "reference"})
         _RULE_DEF_DIRS = {"rules", "detectors", "signatures", "patterns", "checks",
                            "yara", "sigma", "indicators", "ruleset", "rulesets"}
         _RULE_DEF_FNAMES = {"gitleaks.toml", ".gitleaks.toml"}
@@ -3580,7 +3586,7 @@ def main():
             pass  # Python 3.6 or non-reconfigurable stream
 
     parser = argparse.ArgumentParser(
-        description="Gatekeeper Security Scanner v1.3.0",
+        description=f"Gatekeeper Security Scanner v{VERSION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python3 gatekeeper.py https://github.com/user/repo\n"

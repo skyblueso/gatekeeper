@@ -6,7 +6,7 @@
 
 Built by [Simcha Brodsky](https://github.com/skyblueso) ([@simchabrodsky](https://x.com/simchabrodsky))
 
-![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-342-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue) ![Tests](https://img.shields.io/badge/tests-346-brightgreen) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 

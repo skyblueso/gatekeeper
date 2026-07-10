@@ -3,7 +3,7 @@ name: security-scanner
 description: Gatekeeper security scanner. Scan a repo, skill, or agent for risks before installing or running it.
 ---
 
-# Gatekeeper v1.4.0
+# Gatekeeper v1.4.1
 
 | name | description |
 | --- | --- |
