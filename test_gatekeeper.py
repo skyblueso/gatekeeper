@@ -1002,6 +1002,16 @@ class TestCLI(unittest.TestCase):
         # argparse version action exits with 0
         self.assertIn(VERSION, result.stdout + result.stderr)
 
+    def test_help_shows_current_version(self):
+        """--help description must carry the current VERSION, guarding against
+        the argparse banner drifting behind the package version (was v1.3.0)."""
+        result = subprocess.run(
+            [sys.executable, self.SCAN_PY, "--help"],
+            capture_output=True, text=True
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(VERSION, result.stdout, "--help banner must show the current VERSION")
+
     def test_nonexistent_target_handled_gracefully(self):
         result = subprocess.run(
             [sys.executable, self.SCAN_PY, "/nonexistent/path/that/does/not/exist"],

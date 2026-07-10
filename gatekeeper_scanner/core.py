@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper Security Scanner v1.3.0
+Gatekeeper Security Scanner
 
 Full-stack security analysis for GitHub repos, MCP servers, AI agent packages,
 and local projects. One command. Every check. Every time.
@@ -3586,7 +3586,7 @@ def main():
             pass  # Python 3.6 or non-reconfigurable stream
 
     parser = argparse.ArgumentParser(
-        description="Gatekeeper Security Scanner v1.3.0",
+        description=f"Gatekeeper Security Scanner v{VERSION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python3 gatekeeper.py https://github.com/user/repo\n"
