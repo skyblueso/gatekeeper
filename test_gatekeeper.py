@@ -746,6 +746,41 @@ class TestScoring(unittest.TestCase):
 
 
 # ============================================================================
+# 4b. Context Classification / Hook Polarity Tests
+# ============================================================================
+
+class TestHookPolarity(unittest.TestCase):
+    """A `hooks/` directory holds install/invocation-time executable code, so its
+    findings must NOT be downgraded like reference docs. Bare `hooks/` paths are
+    neutral: detector severity stands, no downgrade and no path-based uplift."""
+
+    def _classify_and_downgrade(self, file_path, severity="CRITICAL"):
+        scanner = SecurityScanner(skip_deps=True)
+        f = Finding(severity, "EXECUTION", file_path, 1, "eval() executes arbitrary code")
+        ctx = scanner._classify_file_context(f)
+        scanner._apply_context_downgrade(f, ctx)
+        return f, ctx
+
+    def test_hook_dir_critical_not_downgraded(self):
+        """CRITICAL in hooks/ stays CRITICAL (previously silenced to LOW)."""
+        f, ctx = self._classify_and_downgrade("hooks/on_start.py")
+        self.assertFalse(ctx["is_reference"], "hooks/ must not be classified as reference")
+        self.assertEqual(f.severity, "CRITICAL", "hook-dir CRITICAL must not be downgraded")
+        self.assertEqual(f.original_severity, "", "hook-dir finding must not be marked downgraded")
+
+    def test_hook_dir_neutral_not_uplifted(self):
+        """Bare hooks/ path neither downgrades nor uplifts: path alone is not evidence."""
+        f, _ = self._classify_and_downgrade("hooks/util.py", severity="HIGH")
+        self.assertEqual(f.severity, "HIGH", "path string alone must not promote severity")
+
+    def test_reference_dir_still_downgrades(self):
+        """references/ downgrade behavior is preserved (only hooks was removed)."""
+        f, ctx = self._classify_and_downgrade("references/guide.py")
+        self.assertTrue(ctx["is_reference"], "references/ must still classify as reference")
+        self.assertEqual(f.severity, "LOW", "references/ CRITICAL should still downgrade to LOW")
+
+
+# ============================================================================
 # 5. Comment Detection Tests
 # ============================================================================
 

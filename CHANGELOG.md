@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1] - 2026-07-10
+
+Bugfix release: `hooks/` findings are no longer silently downgraded. A `hooks/` directory holds install- and invocation-time executable code (Claude Code event hooks, git hooks, package lifecycle), but it was bucketed with `references/` as documentation, so a CRITICAL or HIGH finding inside `hooks/` was reclassified to LOW and dropped out of the CRITICAL score ceiling. The scanner was muting exactly the install-time execution surface it exists to flag. Test suite grew from 342 to 345, all passing; self-scan stays grade A.
+
+### Fixed
+- **`hooks/` findings were downgraded like reference docs.** `hooks` was a member of the reference/doc classification set (`is_reference`), so CRITICAL/HIGH findings in a `hooks/` directory were downgraded to LOW and excluded from the undowngraded-CRITICAL score ceiling, silencing real install-time execution risk. `hooks` is removed from that set. A bare `hooks/` path is now neutral: detector severity stands, with no downgrade and no path-based uplift (path alone is not evidence of intent). `references/` behavior is unchanged.
+
 ## [1.4.0] - 2026-07-03
 
 Feature release: MCP capability audit. Came out of scanning Google's sec-gemini repo, whose Rust CLI hands the remote model arbitrary process execution, raw TCP, and executable file write through MCP local tools, and the scanner had nothing to say about it. Injection checks look for poisoned words; this release adds the other half: what power an MCP server actually grants the model that connects to it. Test suite grew from 335 to 342, all passing; self-scan stays grade A.

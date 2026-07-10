@@ -65,7 +65,7 @@ from gatekeeper_scanner.reporter import ReportPrinter, generate_sarif  # noqa: F
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
@@ -2988,7 +2988,13 @@ class SecurityScanner:
                                       "playgrounds/", "benchmarks/", "bench/"))
         )
         is_infra = bool(_dirs & {".devcontainer", ".github", ".circleci", ".gitlab"})
-        is_reference = bool(_dirs & {"references", "reference", "hooks"})
+        # NOTE: `hooks` is deliberately NOT treated as reference/doc material.
+        # A `hooks/` directory (Claude Code event hooks, git hooks, package
+        # lifecycle) can hold code that executes at install/invocation time, so
+        # downgrading its findings would silence exactly the install-time threat
+        # this scanner exists to catch. A bare `hooks/` path is left neutral:
+        # detector severity stands, no downgrade and no path-based uplift.
+        is_reference = bool(_dirs & {"references", "reference"})
         _RULE_DEF_DIRS = {"rules", "detectors", "signatures", "patterns", "checks",
                            "yara", "sigma", "indicators", "ruleset", "rulesets"}
         _RULE_DEF_FNAMES = {"gitleaks.toml", ".gitleaks.toml"}
