@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gatekeeper Security Scanner
+Gatekeeper Security Scanner v1.3.0
 
 Full-stack security analysis for GitHub repos, MCP servers, AI agent packages,
 and local projects. One command. Every check. Every time.
@@ -65,7 +65,7 @@ from gatekeeper_scanner.reporter import ReportPrinter, generate_sarif  # noqa: F
 # CONFIGURATION
 # ============================================================================
 
-VERSION = "1.4.1"
+VERSION = "2.0.0.dev0"
 
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
@@ -245,7 +245,12 @@ class SecurityScanner:
         self.no_taint = no_taint
         self.no_yara = no_yara
         self.verbose = verbose
-        self.max_files = self.config.get("max_files", max_files)
+        # Explicit argument (CLI --max-files) wins. DEFAULT_CONFIG always carries a
+        # max_files key, so config.get(...) alone would silently swallow the argument.
+        if max_files != MAX_TOTAL_FILES:
+            self.max_files = max_files
+        else:
+            self.max_files = self.config.get("max_files", MAX_TOTAL_FILES)
         self.exclude_patterns = exclude_patterns or self.config.get("exclude", [])
         self._original_exclude = list(self.exclude_patterns)
         self._target_excludes: List[str] = []  # exclude patterns supplied by the TARGET (config + .gatekeeper-ignore)
@@ -260,6 +265,10 @@ class SecurityScanner:
         self._file_cache: Dict[str, str] = {}
         self._cache_total_bytes: int = 0
         self._diff_files: Optional[Set[str]] = None
+        # Scoped-verdict tracking: effective operator narrowings (files actually
+        # excluded by operator --exclude; CLI-level narrowings appended by main()).
+        self._operator_excluded_count = 0
+        self._extra_scope_narrowings: List[str] = []
         self._project_suppress: List[Dict] = []
         self._custom_patterns: Dict[str, List] = {}
         self._coverage_lock = threading.Lock()
@@ -330,9 +339,19 @@ class SecurityScanner:
             pass
         return fpath
 
+    def _record_parse_failure(self, rel_path: str, exc: Exception):
+        """A Python file broke ast.parse, so AST and taint analysis both saw nothing.
+        One deduplicated ledger entry per file (both analyzers report the same gap)."""
+        self._record_coverage_gap({
+            "path": rel_path,
+            "reason": "python_parse_failure_analyzers_skipped",
+            "error": f"{type(exc).__name__}: {exc}"[:200],
+        })
+
     def _record_coverage_gap(self, record: Dict):
         """Record a file or line range the scanner could not inspect.
-        Disclosure only: coverage gaps never create findings or move the grade.
+        Coverage gaps never create findings, but they FAIL CLOSED: any recorded gap
+        voids the letter grade — _apply_verdict replaces it with INCOMPLETE.
         Deduplicated by (path, reason) so repeated reads collapse to one entry."""
         key = (record.get("path"), record.get("reason"))
         with self._coverage_lock:
@@ -344,7 +363,8 @@ class SecurityScanner:
     def _emit_coverage_warnings(self):
         """Summarize coverage gaps as warnings so they surface in terminal output and in
         SARIF through the standard warning plumbing (same channel as the file-count cap).
-        Disclosure only: never creates findings or changes the grade."""
+        This path handles human-visible disclosure only; the same gaps also fail closed
+        through _integrity_gap_reasons, which voids the grade (INCOMPLETE)."""
         file_skips = [g for g in self._coverage_gaps if g.get("reason") == "file_exceeds_500KB"]
         line_gaps = [g for g in self._coverage_gaps if "lines_exceed_2000_chars" in str(g.get("reason", ""))]
         excluded = [g for g in self._coverage_gaps if g.get("reason") == "excluded_by_target_config"]
@@ -364,6 +384,14 @@ class SecurityScanner:
             self._add_warning(
                 f"{len(excluded)} file(s) excluded from scan by target config: {names}. "
                 "Target-supplied excludes cannot silently drop files."
+            )
+        parse_fails = [g for g in self._coverage_gaps
+                       if g.get("reason") == "python_parse_failure_analyzers_skipped"]
+        if parse_fails:
+            names = ", ".join(sorted(str(g.get("path", "")) for g in parse_fails)[:30])
+            self._add_warning(
+                f"Coverage: {len(parse_fails)} Python file(s) failed to parse — AST and taint "
+                f"analysis skipped ({names}). A deliberate syntax error can hide payloads."
             )
 
     def _disabled_checks(self) -> List[str]:
@@ -488,15 +516,21 @@ class SecurityScanner:
         self._coverage_gap_keys = set()
         self._scanning_self = False
         self._scan_root = None
+        self._operator_excluded_count = 0
+        # CLI post-filters (--baseline/--disable-rules) append here AFTER scan();
+        # reset so scanner reuse cannot leak a prior run's narrowing state.
+        self._extra_scope_narrowings = []
         self._load_custom_patterns()
         self.exclude_patterns = list(self._original_exclude)
         self._target_excludes = []
         start = datetime.now()
         scan_type, scan_path = self._resolve_target(target)
-        # Auto-set trust: local dirs are trusted (user's own code), remote repos are not
-        # Only auto-detect if the operator didn't explicitly set --trust
-        if not self._trust_explicit:
-            self.trust_target = scan_type in ("local_dir", "local_file")
+        # Trust is opt-in only. A cloned or downloaded repository is "local" by
+        # scan time, so locality is NOT provenance — auto-trusting local paths
+        # let a hostile tree honor its own config and inline ignores. Trust now
+        # requires an explicit --trust, and it scopes the verdict (see
+        # _scope_reasons) because a trusted target can suppress its own findings.
+        self.trust_target = self._trust_explicit
 
         report = ScanReport(
             target=target,
@@ -605,13 +639,12 @@ class SecurityScanner:
                 report.category_summary[f.category] = report.category_summary.get(f.category, 0) + 1
             total_lines = cats.structure.get("total_lines", 0)
             report.score, report.grade = self._calculate_score(verified, total_lines)
-            report.recommendation = self._generate_recommendation(report)
-            report.verdict = {"A": "INSTALL", "B": "INSTALL", "C": "REVIEW BEFORE INSTALLING",
-                              "D": "DO NOT INSTALL — VULNERABLE", "F": "DO NOT INSTALL"}.get(report.grade, "ERROR")
+            self._apply_verdict(report)
             report.tool_description = self._extract_description(scan_path)
             report.tool_type = self._detect_tool_type(cats.structure, scan_path)
             report.structure["tool_type"] = report.tool_type
             report.grade_drivers = self._build_grade_drivers(verified)
+            report.trust_target = self.trust_target
             report.git_history_skipped = any("shallow clone" in w for w in self.warnings)
             report.coverage_gaps = list(self._coverage_gaps)
             self._emit_coverage_warnings()
@@ -762,6 +795,10 @@ class SecurityScanner:
                     # trust cap never sees it. Disclose it so exclusion is never silent.
                     if self._target_excludes and any(fnmatch.fnmatch(rel_path, p) for p in self._target_excludes):
                         self._record_coverage_gap({"path": rel_path, "reason": "excluded_by_target_config"})
+                    elif any(fnmatch.fnmatch(rel_path, p) for p in self._original_exclude):
+                        # Operator exclude: informed consent, so it scopes the verdict
+                        # rather than voiding it — but only when it actually removed a file.
+                        self._operator_excluded_count += 1
                     continue
 
                 # Diff mode: only scan changed files
@@ -1033,8 +1070,13 @@ class SecurityScanner:
         """Run AST-based analysis on Python files (supplements regex detection)."""
         try:
             from gatekeeper_scanner.ast_scanner import ASTScanner
-        except ImportError:
-            return  # Graceful degradation if module is missing
+        except ImportError as e:
+            # Fail closed: a missing analyzer is lost coverage, not a silent pass.
+            self._record_coverage_gap({
+                "path": "*", "reason": "ast_analyzer_unavailable",
+                "error": str(e)[:200],
+            })
+            return
         ast_scanner = ASTScanner()
         workers = min(8, (os.cpu_count() or 4))
 
@@ -1044,19 +1086,26 @@ class SecurityScanner:
             content = self._read_file(fpath)
             if content is None:
                 return []
-            return ast_scanner.scan_file(fpath, rel_path, content,
-                                            trust_target=self.trust_target)
+            return ast_scanner.scan_file(
+                fpath, rel_path, content, trust_target=self.trust_target,
+                on_parse_failure=lambda e: self._record_parse_failure(rel_path, e))
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(_scan_one, fp, rp, ext)
+            futures = {
+                pool.submit(_scan_one, fp, rp, ext): rp
                 for fp, rp, ext in cats.source_files
-            ]
+            }
             for future in as_completed(futures):
                 try:
                     self._add_findings(future.result())
-                except Exception:
-                    pass  # AST parse failures already return [] inside scan_file
+                except Exception as e:
+                    # Parse failures are handled inside scan_file; anything that
+                    # reaches here is a post-parse analyzer crash (visitor bug,
+                    # recursion blowup). Fail closed: record the lost coverage.
+                    self._record_coverage_gap({
+                        "path": futures[future], "reason": "ast_analyzer_error",
+                        "error": f"{type(e).__name__}: {e}"[:200],
+                    })
 
     def _scan_multiline_patterns(self, cats: CategorizedFiles):
         """Scan for patterns that span multiple lines."""
@@ -2006,56 +2055,85 @@ class SecurityScanner:
             "package_manager": None, "total_deps": 0,
             "audit_findings": [], "suspicious_packages": [],
             "unpinned": [], "phantom_deps": [], "lockfile_issues": [],
+            "audit_status": {},   # ecosystem -> {status, manifest, detail, ...}
         }
 
+        # Every detected ecosystem is audited independently. A repo with both
+        # Python and JS manifests must not drop one because the other was seen
+        # last (the old single package_manager bug).
         req_file = os.path.join(path, "requirements.txt")
         pyproject = os.path.join(path, "pyproject.toml")
+        pkg_json = os.path.join(path, "package.json")
+        go_mod = os.path.join(path, "go.mod")
+        cargo_toml = os.path.join(path, "Cargo.toml")
 
+        # ---- Python ----
         py_declared: Set[str] = set()
         py_optional: Set[str] = set()
-        py_sources: Dict[str, str] = {}  # pkg -> manifest basename it was declared in
+        py_sources: Dict[str, str] = {}
+        py_pinned = 0
+        req_declared: Set[str] = set()
+        toml_failed = False
         if os.path.exists(req_file):
             report["package_manager"] = "pip"
-            req_declared = self._scan_python_deps(req_file, report, path)
+            req_declared, req_pinned = self._scan_python_deps(req_file, report, path)
             py_declared |= req_declared
+            py_pinned += req_pinned
             for pkg in req_declared:
                 py_sources.setdefault(pkg, "requirements.txt")
         if os.path.exists(pyproject):
-            report["package_manager"] = "pip"
-            proj_declared, proj_optional = self._scan_pyproject_deps(pyproject, report)
+            report["package_manager"] = report["package_manager"] or "pip"
+            proj_declared, proj_optional, toml_failed = self._scan_pyproject_deps(pyproject, report)
             py_declared |= proj_declared
             py_optional |= proj_optional
             for pkg in proj_declared:
                 py_sources.setdefault(pkg, "pyproject.toml")
-
-        # Unified phantom dep check — run once after both sources have contributed
         if py_declared:
             self._check_phantom_deps_python(py_declared, path, report, py_optional, py_sources)
+        if toml_failed:
+            # Malformed pyproject.toml: real parse failure, not a clean audit.
+            self._set_audit_status(report, "python", "unparseable", "pyproject.toml",
+                                   "pyproject.toml is not valid TOML")
+        elif os.path.exists(req_file):
+            # pip-audit reads requirements.txt only; deps declared ONLY in
+            # pyproject were never handed to it → partial coverage.
+            self._audit_python(path, report, req_declared, py_pinned,
+                               pyproject_only_extra=bool(py_declared - req_declared))
+        elif os.path.exists(pyproject) and py_declared:
+            self._set_audit_status(report, "python", "unaudited", "pyproject.toml",
+                                   f"{len(py_declared)} pyproject-declared dependencies have no CVE auditor input yet")
 
-        pkg_json = os.path.join(path, "package.json")
+        # ---- JavaScript ----
         if os.path.exists(pkg_json):
-            report["package_manager"] = "npm"
-            self._scan_js_deps(pkg_json, path, report)
-            self._check_lockfile_integrity(path, report)
+            report["package_manager"] = report["package_manager"] or "npm"
+            if self._scan_js_deps(pkg_json, path, report):
+                self._check_lockfile_integrity(path, report)
+                self._audit_npm(path, report)
+            else:
+                self._set_audit_status(report, "javascript", "unparseable", "package.json",
+                                       "package.json is not valid JSON")
 
-        go_mod = os.path.join(path, "go.mod")
+        # ---- Go ----
         if os.path.exists(go_mod):
-            if not report["package_manager"]:
-                report["package_manager"] = "go"
+            report["package_manager"] = report["package_manager"] or "go"
             self._scan_go_deps(go_mod, report)
+            self._audit_go(go_mod, report)
 
-        cargo_toml = os.path.join(path, "Cargo.toml")
+        # ---- Rust ----
         if os.path.exists(cargo_toml):
-            if not report["package_manager"]:
-                report["package_manager"] = "cargo"
+            report["package_manager"] = report["package_manager"] or "cargo"
             self._scan_cargo_deps(cargo_toml, report)
-
-        if report["package_manager"] == "pip":
-            self._run_pip_audit(path, report)
-        elif report["package_manager"] == "npm":
-            self._run_npm_audit(path, report)
+            self._audit_cargo(cargo_toml, report)
 
         return report
+
+    def _finalize_audit(self, report: Dict, ecosystem: str, manifest: str,
+                        findings_before: int, via: str = ""):
+        """Clean vs vulnerable from THIS ecosystem's finding delta (never the
+        shared list total, which would let one ecosystem taint another)."""
+        delta = len(report["audit_findings"]) - findings_before
+        status = "vulnerable" if delta > 0 else "clean"
+        self._set_audit_status(report, ecosystem, status, manifest, via)
 
     def _check_suspicious_package(self, pkg: str, file: str, report: Dict):
         """Check a package name against known suspicious/typosquat packages."""
@@ -2070,6 +2148,7 @@ class SecurityScanner:
 
     def _scan_python_deps(self, req_file: str, report: Dict, scan_path: str):
         declared = set()
+        pinned = 0
         try:
             with open(req_file, "r") as f:
                 for line in f:
@@ -2081,10 +2160,12 @@ class SecurityScanner:
                     declared.add(pkg.lower())
                     if not re.search(r"[><=!~]=|[><]", line):
                         report["unpinned"].append(pkg)
+                    if re.search(r"==\s*[A-Za-z0-9._+!-]+", line):
+                        pinned += 1  # OSV can only query exact-pinned versions
                     self._check_suspicious_package(pkg, "requirements.txt", report)
         except (OSError, IOError) as e:
             self._add_warning(f"Could not read requirements.txt: {e}")
-        return declared
+        return declared, pinned
 
     def _emit_phantom_findings(self, new_phantoms, source_of, suspicious_names, cap=10):
         """Emit phantom-dependency findings with a display cap that is never silent and
@@ -2171,9 +2252,14 @@ class SecurityScanner:
         )
 
     def _scan_pyproject_deps(self, pyproject: str, report: Dict):
+        """Returns (declared, optional, toml_parse_failed). toml_parse_failed is
+        True only when a real TOML parser was available and the file is malformed
+        — the caller marks the ecosystem unparseable instead of silently trusting
+        the regex fallback (which can under-count deps and hide an audit target)."""
         declared = set()
         optional = set()
         scan_path = os.path.dirname(pyproject)
+        toml_parse_failed = False
 
         parsed = False
         if tomllib:
@@ -2204,11 +2290,16 @@ class SecurityScanner:
                         report["total_deps"] += 1
                         self._check_suspicious_package(pkg, "pyproject.toml", report)
                 parsed = True
-            except (OSError, ValueError, KeyError) as e:
-                self._add_warning(f"Could not parse pyproject.toml: {e}")
+            except (ValueError,) as e:
+                # tomllib.TOMLDecodeError subclasses ValueError: the file IS
+                # malformed. Do NOT regex-rescue — that would hide audit targets.
+                self._add_warning(f"pyproject.toml is not valid TOML: {e}")
+                return declared, optional, True
+            except (OSError, KeyError) as e:
+                self._add_warning(f"Could not read pyproject.toml: {e}")
 
         if not parsed:
-            # Fallback: regex parsing for Python 3.9-3.10 or malformed TOML
+            # Fallback: regex parsing for Python 3.9-3.10 that lacks any TOML parser.
             try:
                 with open(pyproject, "r") as f:
                     content = f.read()
@@ -2246,7 +2337,7 @@ class SecurityScanner:
             except (OSError, IOError) as e:
                 self._add_warning(f"Could not read pyproject.toml: {e}")
 
-        return declared, optional
+        return declared, optional, toml_parse_failed
 
     def _scan_js_deps(self, pkg_json: str, path: str, report: Dict):
         try:
@@ -2291,8 +2382,10 @@ class SecurityScanner:
                         ))
 
             self._check_phantom_deps_js(pkg, path, report)
+            return True
         except (OSError, json.JSONDecodeError) as e:
             self._add_warning(f"Could not parse package.json: {e}")
+            return False
 
     def _check_phantom_deps_js(self, pkg: Dict, path: str, report: Dict):
         deps = set(pkg.get("dependencies", {}).keys())
@@ -2366,7 +2459,8 @@ class SecurityScanner:
             self._add_warning(f"Could not check lockfile integrity: {e}")
 
     def _scan_go_deps(self, go_mod: str, report: Dict):
-        """Parse go.mod for dependency info and run govulncheck if available."""
+        """Parse go.mod for dependency counts only. The CVE audit runs separately
+        in _audit_go so its outcome feeds the audit state machine."""
         try:
             with open(go_mod, "r") as f:
                 content = f.read()
@@ -2387,35 +2481,10 @@ class SecurityScanner:
                     report["total_deps"] += 1
         except (OSError, IOError) as e:
             self._add_warning(f"Could not read go.mod: {e}")
-        # Try govulncheck if available
-        scan_path = os.path.dirname(go_mod)
-        govulncheck_bin = self._resolve_binary("govulncheck")
-        if not govulncheck_bin:
-            return
-        try:
-            result = subprocess.run(
-                [govulncheck_bin, "-json", "./..."],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, cwd=scan_path
-            )
-            if result.stdout:
-                try:
-                    for line in result.stdout.strip().split("\n"):
-                        entry = json.loads(line)
-                        vuln = entry.get("vulnerability")
-                        if vuln:
-                            report["audit_findings"].append({"package": vuln.get("module", "?"), "severity": "high", "description": vuln.get("id", "")})
-                            self._add_finding(Finding(
-                                severity="HIGH", category="DEPENDENCY",
-                                file="go.mod", line=0,
-                                message=f"Go vulnerability: {vuln.get('id', '?')} in {vuln.get('module', '?')}",
-                            ))
-                except (json.JSONDecodeError, KeyError):
-                    pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
 
     def _scan_cargo_deps(self, cargo_toml: str, report: Dict):
-        """Parse Cargo.toml for dependency info and run cargo audit if available."""
+        """Parse Cargo.toml for dependency counts only. The CVE audit runs
+        separately in _audit_cargo so its outcome feeds the audit state machine."""
         try:
             with open(cargo_toml, "r") as f:
                 content = f.read()
@@ -2432,94 +2501,293 @@ class SecurityScanner:
                     report["total_deps"] += 1
         except (OSError, IOError) as e:
             self._add_warning(f"Could not read Cargo.toml: {e}")
-        # Try cargo audit if available
-        scan_path = os.path.dirname(cargo_toml)
-        cargo_bin = self._resolve_binary("cargo")
-        if not cargo_bin:
-            return
-        try:
-            result = subprocess.run(
-                [cargo_bin, "audit", "--json"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, cwd=scan_path
-            )
-            if result.stdout:
-                try:
-                    data = json.loads(result.stdout)
-                    for vuln in data.get("vulnerabilities", {}).get("list", []):
-                        advisory = vuln.get("advisory", {})
-                        report["audit_findings"].append({"package": advisory.get("package", "?"), "severity": "high", "description": advisory.get("title", "")})
-                        self._add_finding(Finding(
-                            severity="HIGH", category="DEPENDENCY",
-                            file="Cargo.toml", line=0,
-                            message=f"Rust vulnerability: {advisory.get('id', '?')} in {advisory.get('package', '?')}",
-                        ))
-                except (json.JSONDecodeError, KeyError):
-                    pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
 
-    def _run_pip_audit(self, path: str, report: Dict):
+    # Audit outcome states. "No vulnerabilities returned" counts as clean ONLY
+    # when the auditor completed AND its output parsed. Everything else is a
+    # distinct fail-closed state that lands in the coverage ledger.
+    _AUDIT_FAIL_STATES = ("unavailable", "timed_out", "unparseable", "error",
+                          "unaudited", "no_lockfile", "unsupported", "partial")
+
+    def _set_audit_status(self, report: Dict, ecosystem: str, status: str,
+                          manifest: str = "", detail: str = ""):
+        report.setdefault("audit_status", {})[ecosystem] = {
+            "status": status, "manifest": manifest, "detail": detail[:200],
+        }
+        if status in self._AUDIT_FAIL_STATES:
+            self._record_coverage_gap({
+                "path": manifest or ecosystem,
+                "reason": f"dependency_audit_{status}",
+                "error": detail[:200] or f"{ecosystem} dependency audit {status}",
+            })
+
+    def _audit_python(self, path: str, report: Dict, req_declared: Set[str], pinned_count: int,
+                      pyproject_only_extra: bool = False):
+        """Audit requirements.txt via pip-audit, falling back to OSV.dev. OSV can
+        only query exact-pinned deps, so a repo with unpinned deps is 'partial',
+        never clean. pip-audit reads requirements.txt only, so deps declared only
+        in pyproject.toml also make the ecosystem partial."""
         req = os.path.join(path, "requirements.txt")
-        if not os.path.exists(req):
-            return
+        declared_count = len(req_declared)
+        before = len(report["audit_findings"])
         pip_audit_bin = self._resolve_binary("pip-audit")
-        if not pip_audit_bin:
-            if self._osv_python(path, report):
-                return
-            self._add_warning("pip-audit not installed — CVE scanning skipped. Install with: pip install pip-audit")
-            return
-        try:
-            result = subprocess.run([pip_audit_bin, "--format", "json", "-r", req],
-                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
-            if result.stdout:
-                try:
-                    data = json.loads(result.stdout)
-                    for dep in data.get("dependencies", []):
-                        for vuln in dep.get("vulns", []):
-                            pkg = dep.get("name", "?")
-                            vid = vuln.get("id", "?")
-                            desc = vuln.get("description", "")[:200]
-                            report["audit_findings"].append({
-                                "package": pkg, "severity": "high",
-                                "description": f"{vid}: {desc}",
-                            })
-                            self._add_finding(Finding(
-                                severity="HIGH", category="DEPENDENCY",
-                                file="requirements.txt", line=0,
-                                message=f"CVE in {pkg}: {vid} — {desc[:100]}",
-                            ))
-                except (json.JSONDecodeError, KeyError):
-                    pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        if pip_audit_bin:
+            try:
+                result = subprocess.run([pip_audit_bin, "--format", "json", "-r", req],
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+            except FileNotFoundError as e:
+                return self._python_osv_fallback(path, report, declared_count, pinned_count, str(e))
+            except subprocess.TimeoutExpired:
+                return self._set_audit_status(report, "python", "timed_out", "requirements.txt",
+                                              "pip-audit exceeded 30s")
+            # pip-audit exits 0 (clean) or 1 (vulns found). Any other code is a
+            # failure even if it printed valid-looking JSON.
+            if result.returncode not in (0, 1):
+                return self._set_audit_status(report, "python", "error", "requirements.txt",
+                                              f"pip-audit exit {result.returncode}: {(result.stderr or '')[:150]}")
+            if not result.stdout:
+                return self._set_audit_status(report, "python", "error", "requirements.txt",
+                                              f"pip-audit exit {result.returncode}: no output")
+            try:
+                data = json.loads(result.stdout)
+            except (json.JSONDecodeError, ValueError) as e:
+                return self._set_audit_status(report, "python", "unparseable", "requirements.txt",
+                                              f"pip-audit output not JSON: {e}")
+            # Schema guard: pip-audit emits {"dependencies": [ {name, vulns:[...]} ]}.
+            if not isinstance(data, dict) or not isinstance(data.get("dependencies"), list):
+                return self._set_audit_status(report, "python", "unparseable", "requirements.txt",
+                                              "pip-audit JSON missing 'dependencies' list")
+            audited_names = set()
+            for dep in data["dependencies"]:
+                if not isinstance(dep, dict):
+                    return self._set_audit_status(report, "python", "unparseable", "requirements.txt",
+                                                  "pip-audit dependency entry is not an object")
+                name = dep.get("name")
+                if isinstance(name, str):
+                    audited_names.add(name.lower())
+                vulns = dep.get("vulns", [])
+                # A non-list 'vulns' is a schema violation, not an empty/clean dep.
+                if not isinstance(vulns, list):
+                    return self._set_audit_status(report, "python", "unparseable", "requirements.txt",
+                                                  f"pip-audit 'vulns' for {name} is not a list")
+                for vuln in vulns:
+                    if not isinstance(vuln, dict):
+                        return self._set_audit_status(report, "python", "unparseable", "requirements.txt",
+                                                      "pip-audit vuln entry is not an object")
+                    pkg = dep.get("name", "?"); vid = vuln.get("id", "?")
+                    desc = str(vuln.get("description", ""))[:200]
+                    report["audit_findings"].append({"package": pkg, "severity": "high",
+                                                     "description": f"{vid}: {desc}"})
+                    self._add_finding(Finding(severity="HIGH", category="DEPENDENCY",
+                                              file="requirements.txt", line=0,
+                                              message=f"CVE in {pkg}: {vid} — {desc[:100]}"))
+            # Completeness: every declared requirement must appear in the audit
+            # result. A short response (declared package absent) is partial, the
+            # native-auditor analogue of the OSV short-batch bug.
+            missing = {n for n in req_declared if n not in audited_names}
+            if missing:
+                return self._set_audit_status(
+                    report, "python", "partial", "requirements.txt",
+                    f"pip-audit result omitted {len(missing)} declared package(s): "
+                    f"{', '.join(sorted(missing))[:120]}")
+            if pyproject_only_extra:
+                return self._set_audit_status(report, "python", "partial", "requirements.txt",
+                                              "pyproject.toml declares dependencies absent from "
+                                              "requirements.txt; pip-audit never audited them")
+            return self._finalize_audit(report, "python", "requirements.txt", before, "via pip-audit")
+        # No native auditor: OSV fallback (pinned-only).
+        return self._python_osv_fallback(path, report, declared_count, pinned_count,
+                                         "pip-audit not installed")
 
-    def _run_npm_audit(self, path: str, report: Dict):
-        if not os.path.exists(os.path.join(path, "package-lock.json")):
-            return
+    def _osv_partial_reason(self, report: Dict):
+        """A partial-coverage reason string if OSV's query set was capped (>400
+        packages) or the batch response was short, else None. Fails closed on
+        either, since unqueried packages could hide a CVE."""
+        cov = report.get("_osv_coverage") or {}
+        queried = cov.get("queried", 0)
+        requested = cov.get("requested", 0)
+        responded = cov.get("responded", queried)
+        if requested > queried:
+            return f"OSV query set capped at {queried} of {requested} packages ({requested - queried} never queried)"
+        if responded < queried:
+            return f"OSV returned {responded} results for {queried} queried packages (short batch)"
+        return None
+
+    def _python_osv_fallback(self, path: str, report: Dict, declared_count: int,
+                             pinned_count: int, why: str):
+        before = len(report["audit_findings"])
+        ran = self._osv_python(path, report) if self._osv_enabled() else False
+        if not ran:
+            self._add_warning("pip-audit not installed — CVE scanning skipped. Install with: pip install pip-audit")
+            return self._set_audit_status(report, "python", "unavailable", "requirements.txt",
+                                          f"{why}; OSV.dev fallback did not run")
+        # OSV only queried exact-pinned deps. Unpinned deps were never audited.
+        if pinned_count < declared_count:
+            return self._set_audit_status(
+                report, "python", "partial", "requirements.txt",
+                f"OSV audited {pinned_count} pinned of {declared_count} declared; "
+                f"{declared_count - pinned_count} unpinned dependency(ies) never queried")
+        cap_reason = self._osv_partial_reason(report)
+        if cap_reason:
+            return self._set_audit_status(report, "python", "partial", "requirements.txt", cap_reason)
+        return self._finalize_audit(report, "python", "requirements.txt", before, "via OSV.dev (pinned)")
+
+    def _audit_npm(self, path: str, report: Dict):
+        lock_path = os.path.join(path, "package-lock.json")
+        if not os.path.exists(lock_path):
+            return self._set_audit_status(report, "javascript", "no_lockfile", "package.json",
+                                          "no package-lock.json — npm audit and OSV need resolved versions")
+        # A malformed lockfile is a real parse failure, not 'unavailable'. Detect
+        # it up front so neither the OSV fallback nor npm's own error masks it.
+        try:
+            with open(lock_path, "r") as _lf:
+                json.load(_lf)
+        except (OSError, json.JSONDecodeError) as e:
+            return self._set_audit_status(report, "javascript", "unparseable", "package-lock.json",
+                                          f"package-lock.json is not valid JSON: {e}")
+        before = len(report["audit_findings"])
         npm_bin = self._resolve_binary("npm")
         if not npm_bin:
-            if self._osv_npm(path, report):
-                return
+            if self._osv_enabled() and self._osv_npm(path, report):
+                cap_reason = self._osv_partial_reason(report)
+                if cap_reason:
+                    return self._set_audit_status(report, "javascript", "partial", "package-lock.json", cap_reason)
+                return self._finalize_audit(report, "javascript", "package-lock.json", before, "via OSV.dev")
             self._add_warning("npm not found — CVE scanning skipped")
-            return
+            return self._set_audit_status(report, "javascript", "unavailable", "package-lock.json",
+                                          "npm not found and OSV.dev fallback did not run")
         try:
-            result = subprocess.run([npm_bin, "audit", "--json", "--omit=dev"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=path)
-            if result.stdout:
-                for name, info in json.loads(result.stdout).get("vulnerabilities", {}).items():
-                    sev = info.get("severity", "low")
-                    report["audit_findings"].append({"package": name, "severity": sev, "description": info.get("title", "")})
-                    if sev in ("critical", "high"):
-                        self._add_finding(Finding(
-                            severity="HIGH", category="DEPENDENCY",
-                            file="package.json", line=0,
-                            message=f"npm audit: {name} — {info.get('title', sev)}",
-                        ))
+            result = subprocess.run([npm_bin, "audit", "--json", "--omit=dev"], capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace", timeout=30, cwd=path)
         except FileNotFoundError:
-            if self._osv_npm(path, report):
-                return
-            self._add_warning("WARNING: npm not available — CVE scanning skipped. Install Node.js")
-        except (subprocess.TimeoutExpired, json.JSONDecodeError):
-            pass
+            if self._osv_enabled() and self._osv_npm(path, report):
+                return self._finalize_audit(report, "javascript", "package-lock.json", before, "via OSV.dev")
+            return self._set_audit_status(report, "javascript", "unavailable", "package-lock.json",
+                                          "npm not runnable and OSV.dev fallback did not run")
+        except subprocess.TimeoutExpired:
+            return self._set_audit_status(report, "javascript", "timed_out", "package-lock.json",
+                                          "npm audit exceeded 30s")
+        # npm audit exits 0 (clean) or 1 (vulns found). Other codes are failures.
+        if result.returncode not in (0, 1):
+            return self._set_audit_status(report, "javascript", "error", "package-lock.json",
+                                          f"npm audit exit {result.returncode}: {(result.stderr or '')[:150]}")
+        if not result.stdout:
+            return self._set_audit_status(report, "javascript", "error", "package-lock.json",
+                                          f"npm audit exit {result.returncode}: no output")
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as e:
+            return self._set_audit_status(report, "javascript", "unparseable", "package-lock.json",
+                                          f"npm audit output not JSON: {e}")
+        # Schema guard: a real audit result has a "vulnerabilities" OBJECT (dict).
+        # npm's error JSON ({"error": {...}}) or a list must NOT be read as clean.
+        if not isinstance(data, dict) or not isinstance(data.get("vulnerabilities"), dict):
+            err = (data.get("error") if isinstance(data, dict) else None) or {}
+            return self._set_audit_status(report, "javascript", "error", "package-lock.json",
+                                          f"npm audit has no vulnerabilities object: {str(err)[:120]}")
+        for name, info in data["vulnerabilities"].items():
+            if not isinstance(info, dict):
+                # A malformed entry could BE the omitted vulnerability record —
+                # fail closed, never skip-then-clean.
+                return self._set_audit_status(report, "javascript", "unparseable", "package-lock.json",
+                                              f"npm audit vulnerability entry for {str(name)[:40]} is not an object")
+            sev = info.get("severity", "low")
+            report["audit_findings"].append({"package": name, "severity": sev, "description": info.get("title", "")})
+            if sev in ("critical", "high"):
+                self._add_finding(Finding(severity="HIGH", category="DEPENDENCY",
+                                          file="package.json", line=0,
+                                          message=f"npm audit: {name} — {info.get('title', sev)}"))
+        return self._finalize_audit(report, "javascript", "package-lock.json", before, "via npm audit")
+
+    def _audit_go(self, go_mod: str, report: Dict):
+        """Go IS supported via govulncheck; a missing binary is unavailable, not
+        unsupported. Findings are attributed to the go ecosystem only."""
+        before = len(report["audit_findings"])
+        gv = self._resolve_binary("govulncheck")
+        if not gv:
+            return self._set_audit_status(report, "go", "unavailable", "go.mod",
+                                          "govulncheck not installed (go install golang.org/x/vuln/cmd/govulncheck@latest)")
+        try:
+            result = subprocess.run([gv, "-json", "./..."], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=60, cwd=os.path.dirname(go_mod))
+        except FileNotFoundError:
+            return self._set_audit_status(report, "go", "unavailable", "go.mod", "govulncheck not runnable")
+        except subprocess.TimeoutExpired:
+            return self._set_audit_status(report, "go", "timed_out", "go.mod", "govulncheck exceeded 60s")
+        # govulncheck exits 0 (no vulns) or 3 (vulns found). Others are failures.
+        if result.returncode not in (0, 3):
+            return self._set_audit_status(report, "go", "error", "go.mod",
+                                          f"govulncheck exit {result.returncode}: {(result.stderr or '')[:120]}")
+        if not result.stdout:
+            return self._finalize_audit(report, "go", "go.mod", before, "via govulncheck")
+        # govulncheck -json emits newline-delimited JSON objects. A malformed line
+        # means the stream was truncated or corrupted — do NOT silently skip it and
+        # then call the rest clean; that could drop a vulnerability message.
+        parsed_any = False
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                return self._set_audit_status(report, "go", "unparseable", "go.mod",
+                                              "govulncheck emitted a malformed JSON line (truncated/corrupted stream)")
+            parsed_any = True
+            vuln = entry.get("vulnerability") if isinstance(entry, dict) else None
+            if vuln:
+                report["audit_findings"].append({"package": vuln.get("module", "?"),
+                                                 "severity": "high", "description": vuln.get("id", "")})
+                self._add_finding(Finding(severity="HIGH", category="DEPENDENCY", file="go.mod", line=0,
+                                          message=f"Go vulnerability: {vuln.get('id','?')} in {vuln.get('module','?')}"))
+        if not parsed_any:
+            return self._set_audit_status(report, "go", "unparseable", "go.mod",
+                                          "govulncheck produced no parseable JSON lines")
+        return self._finalize_audit(report, "go", "go.mod", before, "via govulncheck")
+
+    def _audit_cargo(self, cargo_toml: str, report: Dict):
+        """Rust IS supported via cargo-audit; a missing binary is unavailable."""
+        before = len(report["audit_findings"])
+        cargo_bin = self._resolve_binary("cargo")
+        if not cargo_bin:
+            return self._set_audit_status(report, "rust", "unavailable", "Cargo.toml",
+                                          "cargo-audit not installed (cargo install cargo-audit)")
+        try:
+            result = subprocess.run([cargo_bin, "audit", "--json"], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=60, cwd=os.path.dirname(cargo_toml))
+        except FileNotFoundError:
+            return self._set_audit_status(report, "rust", "unavailable", "Cargo.toml", "cargo not runnable")
+        except subprocess.TimeoutExpired:
+            return self._set_audit_status(report, "rust", "timed_out", "Cargo.toml", "cargo audit exceeded 60s")
+        # cargo audit exits 0 (clean) or 1 (vulns found). Others are failures.
+        if result.returncode not in (0, 1):
+            return self._set_audit_status(report, "rust", "error", "Cargo.toml",
+                                          f"cargo audit exit {result.returncode}: {(result.stderr or '')[:120]}")
+        if not result.stdout:
+            return self._set_audit_status(report, "rust", "error", "Cargo.toml",
+                                          f"cargo audit exit {result.returncode}: no output")
+        try:
+            data = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError) as e:
+            return self._set_audit_status(report, "rust", "unparseable", "Cargo.toml",
+                                          f"cargo audit output not JSON: {e}")
+        # Schema guard: vulnerabilities must be an object and its 'list' a list.
+        vulns_obj = data.get("vulnerabilities") if isinstance(data, dict) else None
+        if not isinstance(vulns_obj, dict) or not isinstance(vulns_obj.get("list"), list):
+            return self._set_audit_status(report, "rust", "error", "Cargo.toml",
+                                          "cargo audit JSON missing a valid 'vulnerabilities.list'")
+        for vuln in vulns_obj.get("list", []):
+            if not isinstance(vuln, dict):
+                # A malformed entry could BE the omitted advisory — fail closed.
+                return self._set_audit_status(report, "rust", "unparseable", "Cargo.toml",
+                                              "cargo audit vulnerability entry is not an object")
+            advisory = vuln.get("advisory", {})
+            if not isinstance(advisory, dict):
+                return self._set_audit_status(report, "rust", "unparseable", "Cargo.toml",
+                                              "cargo audit advisory entry is not an object")
+            report["audit_findings"].append({"package": advisory.get("package", "?"),
+                                             "severity": "high", "description": advisory.get("title", "")})
+            self._add_finding(Finding(severity="HIGH", category="DEPENDENCY", file="Cargo.toml", line=0,
+                                      message=f"Rust vulnerability: {advisory.get('id','?')} in {advisory.get('package','?')}"))
+        return self._finalize_audit(report, "rust", "Cargo.toml", before, "via cargo audit")
 
     # ------------------------------------------------------------------
     # Intra-function taint analysis (Python)
@@ -2532,7 +2800,12 @@ class SecurityScanner:
             return
         try:
             from gatekeeper_scanner import taint
-        except ImportError:
+        except ImportError as e:
+            # Fail closed: a missing analyzer is lost coverage, not a silent pass.
+            self._record_coverage_gap({
+                "path": "*", "reason": "taint_analyzer_unavailable",
+                "error": str(e)[:200],
+            })
             return
         for fpath, rel_path, ext in cats.source_files:
             if ext != ".py":
@@ -2540,7 +2813,18 @@ class SecurityScanner:
             content = self._read_file(fpath)
             if content is None:
                 continue
-            for t in taint.analyze(rel_path, content):
+            try:
+                results = taint.analyze(
+                    rel_path, content,
+                    on_parse_failure=lambda e, rp=rel_path: self._record_parse_failure(rp, e))
+            except Exception as e:
+                # Post-parse analyzer crash — record the lost coverage, keep scanning.
+                self._record_coverage_gap({
+                    "path": rel_path, "reason": "taint_analyzer_error",
+                    "error": f"{type(e).__name__}: {e}"[:200],
+                })
+                continue
+            for t in results:
                 self._add_finding(Finding(
                     severity=t["severity"], category="TAINT",
                     file=rel_path, line=t["line"], message=t["message"],
@@ -2556,20 +2840,34 @@ class SecurityScanner:
         known-bad content (webshells, reverse shells, miners, droppers) that
         pattern/AST matching misses. Optional: skipped if yara-python absent."""
         if self.no_yara:
-            return
+            return  # Explicit operator opt-out — disclosed via _disabled_checks
         try:
             from gatekeeper_scanner import yara_engine
-        except ImportError:
+        except ImportError as e:
+            self._record_coverage_gap({
+                "path": "*", "reason": "yara_engine_unavailable",
+                "error": str(e)[:200],
+            })
             return
         if not yara_engine.available():
+            # Fail closed: the signature engine silently missing is lost coverage.
+            # Operators who accept that run --no-yara explicitly.
             self._add_warning(
                 "YARA signature scan skipped — yara-python not installed "
-                "(pip install yara-python enables webshell/miner/dropper signatures).")
+                "(pip install yara-python, or pass --no-yara to accept a scan without signatures).")
+            self._record_coverage_gap({
+                "path": "*", "reason": "yara_engine_unavailable",
+                "error": "yara-python not installed",
+            })
             return
         rules, err = yara_engine.compile_rules()
         if rules is None:
             if err:
                 self._add_warning(f"YARA signature scan skipped — {err}")
+            self._record_coverage_gap({
+                "path": "*", "reason": "yara_rules_unavailable",
+                "error": (err or "rule compilation failed")[:200],
+            })
             return
 
         seen_paths = set()
@@ -2589,11 +2887,30 @@ class SecurityScanner:
             if rp.lower().endswith((".yar", ".yara", ".sigma")):
                 continue
             try:
+                # Read one byte past the cap so truncation is detectable.
                 with open(fp, "rb") as fh:
-                    data = fh.read(yara_engine.MAX_SCAN_BYTES)
-            except (OSError, IOError):
+                    data = fh.read(yara_engine.MAX_SCAN_BYTES + 1)
+            except (OSError, IOError) as e:
+                # Fail closed: a target the signature engine cannot read is
+                # unscanned content, not a clean file.
+                self._record_coverage_gap({
+                    "path": rp, "reason": "yara_unreadable_file",
+                    "error": f"{type(e).__name__}: {e}"[:200],
+                })
                 continue
-            for m in yara_engine.scan_bytes(rules, data):
+            if len(data) > yara_engine.MAX_SCAN_BYTES:
+                self._record_coverage_gap({
+                    "path": rp, "reason": "yara_scan_truncated",
+                    "error": f"only first {yara_engine.MAX_SCAN_BYTES} bytes signature-scanned",
+                })
+                data = data[:yara_engine.MAX_SCAN_BYTES]
+            matches, scan_err = yara_engine.scan_bytes(rules, data)
+            if scan_err:
+                self._record_coverage_gap({
+                    "path": rp, "reason": "yara_scan_error", "error": scan_err,
+                })
+                continue
+            for m in matches:
                 sev = m["severity"] if m["severity"] in valid_sev else "HIGH"
                 self._add_finding(Finding(
                     severity=sev, category="SIGNATURE", file=rp, line=0,
@@ -2651,7 +2968,8 @@ class SecurityScanner:
             from gatekeeper_scanner.osv import audit_packages
         except ImportError:
             return False
-        results, warning = audit_packages(packages, "PyPI")
+        results, warning, coverage = audit_packages(packages, "PyPI")
+        report["_osv_coverage"] = coverage
         if warning:
             self._add_warning(warning)
             return False
@@ -2689,7 +3007,8 @@ class SecurityScanner:
             from gatekeeper_scanner.osv import audit_packages
         except ImportError:
             return False
-        results, warning = audit_packages(packages, "npm")
+        results, warning, coverage = audit_packages(packages, "npm")
+        report["_osv_coverage"] = coverage
         if warning:
             self._add_warning(warning)
             return False
@@ -3296,7 +3615,124 @@ class SecurityScanner:
 
         return score, grade
 
+    VERDICT_MAP = {"A": "INSTALL", "B": "INSTALL", "C": "REVIEW BEFORE INSTALLING",
+                   "D": "DO NOT INSTALL — VULNERABLE", "F": "DO NOT INSTALL"}
+
+    def _integrity_gap_reasons(self) -> List[str]:
+        """Fail-closed accounting: every way scannable content escaped the detectors.
+
+        Any entry returned here voids the letter grade (verdict becomes INCOMPLETE).
+        Operator-supplied CLI excludes are an explicit, disclosed scoping decision and
+        do NOT appear here; target-supplied excludes DO — a scanned repo must never be
+        able to narrow its own verdict.
+        """
+        reasons = []
+        file_skips = [g for g in self._coverage_gaps if g.get("reason") == "file_exceeds_500KB"]
+        if file_skips:
+            reasons.append(f"{len(file_skips)} scannable file(s) over 500KB were never scanned")
+        line_gaps = [g for g in self._coverage_gaps if "lines_exceed_2000_chars" in str(g.get("reason", ""))]
+        if line_gaps:
+            reasons.append(f"over-length lines were skipped in {len(line_gaps)} file(s)")
+        excluded = [g for g in self._coverage_gaps if g.get("reason") == "excluded_by_target_config"]
+        if excluded:
+            reasons.append(f"{len(excluded)} file(s) were hidden from the scan by the target's own .gatekeeper config")
+        parse_fails = [g for g in self._coverage_gaps
+                       if g.get("reason") == "python_parse_failure_analyzers_skipped"]
+        if parse_fails:
+            reasons.append(f"{len(parse_fails)} Python file(s) failed to parse — AST and taint analysis skipped")
+        dep_fails = [g for g in self._coverage_gaps
+                     if str(g.get("reason", "")).startswith("dependency_audit_")]
+        if dep_fails:
+            reasons.append(f"dependency CVE audit incomplete for {len(dep_fails)} manifest(s)")
+        analyzer_fails = [g for g in self._coverage_gaps
+                          if str(g.get("reason", "")).endswith(
+                              ("_analyzer_error", "_analyzer_unavailable",
+                               "_engine_unavailable", "_rules_unavailable",
+                               "_scan_error", "_unreadable_file", "_scan_truncated"))]
+        if analyzer_fails:
+            reasons.append(f"analyzer/engine failure on {len(analyzer_fails)} target(s) — detection coverage incomplete")
+        other = (len(self._coverage_gaps) - len(file_skips) - len(line_gaps)
+                 - len(excluded) - len(parse_fails) - len(dep_fails) - len(analyzer_fails))
+        if other > 0:
+            # Catch-all so a future gap type can never silently fail open.
+            reasons.append(f"{other} additional coverage gap(s) — see coverage_gaps")
+        if any("File limit reached" in w for w in self.warnings):
+            reasons.append("file limit reached — the repository was only partially walked")
+        return reasons
+
+    # Suppression sources that represent operator/target narrowing. Everything
+    # else _dismiss produces (dedup, per-file caps, INFO noise, FP verification,
+    # self-scan identity) is normal scanner work and must NOT scope the verdict.
+    _NARROWING_SUPPRESSION_SOURCES = frozenset({"config_suppress"})
+
+    def _scope_reasons(self, report: ScanReport) -> List[str]:
+        """Explicit operator narrowings of the scan surface. Unlike integrity gaps
+        these are informed consent, so the letter grade survives as a diagnostic —
+        but the verdict must say the scan covered less than the whole target.
+        Effective narrowing only, where cheap to determine: an --exclude pattern
+        that matched nothing removed no coverage and does not scope."""
+        reasons = []
+        if self.skip_deps:
+            reasons.append("dependency + CVE audit skipped (--skip-deps)")
+        if self.no_taint:
+            reasons.append("taint analysis disabled (--no-taint)")
+        if self.no_yara:
+            reasons.append("YARA signatures disabled (--no-yara)")
+        if self._diff_files is not None:
+            reasons.append("diff mode — only changed files scanned (--diff)")
+        if self.trust_target:
+            reasons.append("target self-suppression honored (--trust): target config and "
+                           "inline gatekeeper:ignore can hide LOW/MEDIUM findings")
+        if self._operator_excluded_count:
+            reasons.append(f"{self._operator_excluded_count} file(s) excluded by operator (--exclude)")
+        suppressed = [f for f in report._all_findings
+                      if not f.verified
+                      and f.suppression_source in self._NARROWING_SUPPRESSION_SOURCES]
+        if suppressed:
+            reasons.append(f"{len(suppressed)} finding(s) suppressed by project config")
+        reasons.extend(self._extra_scope_narrowings)
+        return reasons
+
+    def _apply_verdict(self, report: ScanReport):
+        """Assign verdict + recommendation from the computed grade, failing closed.
+
+        Integrity gaps (involuntary lost coverage) win: grade becomes INCOMPLETE
+        and no install verdict is issued. Explicit operator narrowings produce a
+        SCOPED verdict: the letter survives for the scanned surface, but the
+        verdict names every narrowing and is never a bare whole-target INSTALL.
+        """
+        reasons = self._integrity_gap_reasons()
+        if reasons:
+            report.incomplete = True
+            report.incomplete_reasons = reasons
+            report.scoped = False
+            report.scope_reasons = []
+            report.scoped_grade = report.grade
+            report.grade = "INCOMPLETE"
+            report.verdict = "INCOMPLETE — CONTENT ESCAPED SCANNING, NO INSTALL VERDICT"
+        else:
+            report.incomplete = False
+            report.incomplete_reasons = []
+            scope = self._scope_reasons(report)
+            if scope:
+                report.scoped = True
+                report.scope_reasons = scope
+                report.scoped_grade = report.grade
+                report.verdict = (f"SCOPED {report.grade} — NOT A WHOLE-TARGET VERDICT "
+                                  f"({'; '.join(scope)})")
+            else:
+                report.scoped = False
+                report.scope_reasons = []
+                report.scoped_grade = ""
+                report.verdict = self.VERDICT_MAP.get(report.grade, "ERROR")
+        report.recommendation = self._generate_recommendation(report)
+
     def _generate_recommendation(self, report: ScanReport) -> str:
+        if report.grade == "INCOMPLETE":
+            scoped = f" The scanned portion scored {report.scoped_grade}." if report.scoped_grade else ""
+            return ("Scan incomplete — no install verdict. "
+                    + "; ".join(report.incomplete_reasons) + "." + scoped
+                    + " Resolve the gaps and rescan before trusting this target.")
         critical = sum(1 for f in report.findings if f.severity == "CRITICAL")
         high = sum(1 for f in report.findings if f.severity == "HIGH")
         grade = report.grade
@@ -3305,14 +3741,18 @@ class SecurityScanner:
             msg = "Clean. Safe to install."
             if high > 0:
                 msg += f" Review {high} HIGH finding(s) for awareness."
-            return msg
         elif grade == "B":
-            return f"Low risk. {critical + high} finding(s) worth reviewing before installing."
+            msg = f"Low risk. {critical + high} finding(s) worth reviewing before installing."
         elif grade == "C":
-            return f"Review required. {critical} CRITICAL and {high} HIGH finding(s). Check before installing."
+            msg = f"Review required. {critical} CRITICAL and {high} HIGH finding(s). Check before installing."
         elif grade == "D":
-            return f"Significant risks. {critical} CRITICAL and {high} HIGH finding(s). Do NOT install without review."
-        return f"FAIL. {critical} CRITICAL and {high} HIGH finding(s). Do NOT install."
+            msg = f"Significant risks. {critical} CRITICAL and {high} HIGH finding(s). Do NOT install without review."
+        else:
+            msg = f"FAIL. {critical} CRITICAL and {high} HIGH finding(s). Do NOT install."
+        if report.scoped:
+            msg = ("SCOPED — applies only to the scanned surface ("
+                   + "; ".join(report.scope_reasons) + "). " + msg)
+        return msg
 
     def _detect_tool_type(self, structure: Dict, scan_path: str) -> str:
         """Classify project type based on structure, metadata, and entry points."""
@@ -3586,7 +4026,7 @@ def main():
             pass  # Python 3.6 or non-reconfigurable stream
 
     parser = argparse.ArgumentParser(
-        description=f"Gatekeeper Security Scanner v{VERSION}",
+        description="Gatekeeper Security Scanner v1.3.0",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  python3 gatekeeper.py https://github.com/user/repo\n"
@@ -3606,7 +4046,7 @@ def main():
     parser.add_argument("--exclude", type=str, default="", help="Comma-separated glob patterns to exclude (e.g. 'vendor/**,*.min.js')")
     parser.add_argument("--output", type=str, default="", help="Save report to specific path instead of default location")
     parser.add_argument("--quiet", action="store_true", help="Minimal output — grade and exit code only")
-    parser.add_argument("--trust", action="store_true", help="Trust target code (enables inline suppression for remote repos)")
+    parser.add_argument("--trust", action="store_true", help="Trust the target: honor its .gatekeeper config and inline gatekeeper:ignore comments (LOW/MEDIUM only). OFF by default for ALL targets, including local paths — a cloned repo is local but not authored by you. Scopes the verdict.")
     parser.add_argument("--timeout", type=int, default=0, help="Maximum scan time in seconds (0 = no limit)")
     parser.add_argument("--baseline", type=str, default="", help="Baseline file — only report new findings not in baseline")
     parser.add_argument("--save-baseline", type=str, default="", help="Save current findings as baseline to file")
@@ -3615,6 +4055,8 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output — show file-by-file progress and timing")
     parser.add_argument("--self-scan", action="store_true", help="Scan Gatekeeper's own source code (quick verification)")
     parser.add_argument("--policy", type=str, default="", help="Policy-based pass/fail (e.g. 'critical=0,high<=5')")
+    parser.add_argument("--accept-scoped", action="store_true",
+                        help="Exit 0 for SCOPED scans (explicit opt-outs like --skip-deps/--no-yara/--diff) that pass on grade. Never applies to INCOMPLETE scans.")
     parser.add_argument("--diff", type=str, default="", help="Only scan files changed since <base-ref> (e.g. 'main')")
     parser.add_argument("--version", action="version", version=f"Gatekeeper {VERSION}")
 
@@ -3688,10 +4130,19 @@ def main():
                 ["git", "diff", "--name-only", args.diff, "HEAD"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=diff_target
             )
-            if diff_result.returncode == 0 and diff_result.stdout.strip():
-                scanner._diff_files = set(diff_result.stdout.strip().split("\n"))
+            if diff_result.returncode != 0:
+                # Fail closed: a failed diff must never widen into a full,
+                # unscoped scan the operator did not ask for.
+                logger.error("--diff failed (%s); refusing to fall back to a full scan: %s",
+                             args.diff, diff_result.stderr.strip() or "git error")
+                sys.exit(2)
+            # A valid diff with zero changed files is a legitimate empty scope.
+            scanner._diff_files = {
+                ln for ln in diff_result.stdout.strip().split("\n") if ln
+            }
         else:
-            logger.warning("--diff requires a local directory target; ignored for remote URLs")
+            logger.error("--diff requires a local directory target; refusing to scan %s unscoped", args.target)
+            sys.exit(2)
 
     fail_on = scanner.config.get("fail_on", ["D", "F"])
     try:
@@ -3711,18 +4162,38 @@ def main():
     # Apply --disable-rules
     if disabled_rules:
         report.findings = [f for f in report.findings if f.rule_id not in disabled_rules]
+        # Disabling rules narrows what the verdict means, whether or not any fired.
+        scanner._extra_scope_narrowings.append(
+            f"{len(disabled_rules)} rule(s) disabled (--disable-rules)")
 
     # Apply --baseline (filter out known findings)
-    if args.baseline and os.path.exists(args.baseline):
+    if args.baseline:
+        # Fail closed: an explicitly requested baseline that is missing or
+        # malformed must never be silently skipped — the operator would get an
+        # unfiltered report believing it was baseline-compared (or vice versa).
         try:
             with open(args.baseline, "r") as bf:
-                baseline = set(json.load(bf))
-            report.findings = [
-                f for f in report.findings
-                if hashlib.sha256(f"{f.file}:{f.rule_id}:{f.message}".encode()).hexdigest()[:16] not in baseline
-            ]
-        except (json.JSONDecodeError, OSError):
-            pass
+                baseline_doc = json.load(bf)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error("--baseline file missing or invalid (%s): %s", args.baseline, e)
+            sys.exit(2)
+        # Schema check: must be a list of 16-hex fingerprints. Other valid JSON
+        # shapes coerce badly (an object becomes a set of keys, a number is
+        # noniterable, [{}] is unhashable) — reject them explicitly.
+        if not (isinstance(baseline_doc, list)
+                and all(isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp)
+                        for fp in baseline_doc)):
+            logger.error("--baseline file has invalid schema (%s): expected a JSON "
+                         "list of 16-char hex fingerprints", args.baseline)
+            sys.exit(2)
+        baseline = set(baseline_doc)
+        report.findings = [
+            f for f in report.findings
+            if hashlib.sha256(f"{f.file}:{f.rule_id}:{f.message}".encode()).hexdigest()[:16] not in baseline
+        ]
+        # A baseline-filtered verdict means "no unacceptable NEW findings",
+        # never "safe to install" — that is a scope narrowing.
+        scanner._extra_scope_narrowings.append("baseline filtering applied (--baseline)")
 
     # Save baseline if requested
     if args.save_baseline:
@@ -3736,10 +4207,10 @@ def main():
             print(f"  Baseline saved: {args.save_baseline} ({len(fingerprints)} findings)")
 
     # Recalculate score and recommendation after filtering
-    if disabled_rules or (args.baseline and os.path.exists(args.baseline)):
+    if disabled_rules or args.baseline:
         report.score, report.grade = scanner._calculate_score(
             report.findings, report.structure.get("total_lines", 0))
-        report.recommendation = scanner._generate_recommendation(report)
+        scanner._apply_verdict(report)
         # Recalculate summaries to match filtered findings
         report.severity_summary = {}
         report.category_summary = {}
@@ -3747,8 +4218,6 @@ def main():
         for f in report.findings:
             report.severity_summary[f.severity] = report.severity_summary.get(f.severity, 0) + 1
             report.category_summary[f.category] = report.category_summary.get(f.category, 0) + 1
-        report.verdict = {"A": "INSTALL", "B": "INSTALL", "C": "REVIEW BEFORE INSTALLING",
-                          "D": "DO NOT INSTALL — VULNERABLE", "F": "DO NOT INSTALL"}.get(report.grade, "ERROR")
         report.grade_drivers = scanner._build_grade_drivers(report.findings)
 
     # Determine save path — only create report dir for modes that actually save files
@@ -3806,10 +4275,18 @@ def main():
         print(f"  {printer.DIM}Report saved: {save_path}{printer.RESET}")
         print()
 
-    # Exit code: policy overrides grade-based exit when set
+    # Exit code: policy overrides grade-based exit when set, but no path may
+    # report success for escaped coverage (INCOMPLETE), and scoped scans pass
+    # only when the operator explicitly accepts the narrowed scope.
     if args.policy:
-        sys.exit(0 if _evaluate_policy(report.findings, args.policy) else 1)
-    sys.exit(1 if report.grade in fail_on or report.grade == "ERROR" else 0)
+        sys.exit(0 if _evaluate_policy(report.findings, args.policy)
+                 and not report.incomplete
+                 and (not report.scoped or args.accept_scoped) else 1)
+    if report.grade in fail_on or report.grade in ("ERROR", "INCOMPLETE"):
+        sys.exit(1)
+    if report.scoped and not args.accept_scoped:
+        sys.exit(1)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

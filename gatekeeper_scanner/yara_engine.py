@@ -6,9 +6,10 @@ cryptominers, droppers, embedded PE blobs) that regex/AST pattern matching
 misses because it matches byte signatures and multi-string conditions rather
 than language constructs. Runs over source, text, config, AND binary files.
 
-yara-python is an OPTIONAL dependency. When it is not installed, available()
-returns False and the engine is skipped with a single warning (parity with the
-pip-audit / OSV fallback behavior). The scanner never hard-depends on it.
+yara-python is an optional dependency, but its absence is NOT free: when it is
+not installed, available() returns False and the scanner records a coverage
+gap, so the scan grades INCOMPLETE (fail closed). Operators who accept a scan
+without signature coverage must opt out explicitly with --no-yara.
 
 Rules live in gatekeeper_scanner/yara_rules/*.yar and are authored from
 scratch for this project (no third-party rules), so there is no licensing
@@ -63,14 +64,17 @@ def compile_rules(rules_dir: str = RULES_DIR):
 
 
 def scan_bytes(rules, data: bytes):
-    """Match compiled rules against a byte buffer. Returns a list of dicts
-    {rule, severity, description}. Never raises."""
+    """Match compiled rules against a byte buffer. Returns (matches, error):
+    matches is a list of dicts {rule, severity, description}; error is None on
+    success, else a short string. An engine failure must be visible to the
+    caller so it can be recorded as lost coverage — it is NOT a clean result.
+    Never raises."""
     if rules is None or not data:
-        return []
+        return [], None
     try:
         matches = rules.match(data=data[:MAX_SCAN_BYTES])
-    except Exception:
-        return []
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"[:200]
     out = []
     for m in matches:
         meta = getattr(m, "meta", {}) or {}
@@ -79,4 +83,4 @@ def scan_bytes(rules, data: bytes):
             "severity": str(meta.get("severity", "HIGH")).upper(),
             "description": meta.get("description", getattr(m, "rule", "signature match")),
         })
-    return out
+    return out, None

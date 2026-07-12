@@ -1,12 +1,46 @@
 # Changelog
 
+## [2.0.0.dev0] - Unreleased (P0 fail-closed, in progress)
+
+Work-in-progress development release. This is P0 of a larger hardening effort (P1 grade-integrity and P2 documentation-honesty are NOT done yet; see `STATE.md`). It makes Gatekeeper fail closed: when the scanner could not actually inspect something, it no longer issues a clean letter grade over the gap. Test suite grew from 345 to 410, all passing. This release contains BREAKING changes to verdicts, exit codes, default trust, and dependencies; do not treat it as a drop-in upgrade.
+
+### BREAKING
+- **New `INCOMPLETE` verdict replaces the letter grade whenever coverage was lost.** Excluded/oversized/over-length/unparsed/analyzer-crashed/engine-missing/truncated/unreadable content, hitting the file limit, and any incomplete dependency audit now void the grade instead of scoring around the gap. `INCOMPLETE` exits 1; `--policy` cannot override it.
+- **New `SCOPED` verdict for explicit operator narrowing.** `--skip-deps`, `--no-taint`, `--no-yara`, `--diff`, `--exclude`, `--baseline`, `--disable-rules`, and `--trust` keep the letter as a diagnostic for the scanned surface but never emit a whole-target `INSTALL`. Scoped scans exit 1 unless the new `--accept-scoped` flag is passed.
+- **Local targets are no longer auto-trusted.** A cloned or downloaded repo is local by scan time, so locality is not provenance. The target's `.gatekeeper` config and inline `gatekeeper:ignore` comments are honored only under an explicit `--trust`, which itself scopes the verdict. Default local scans no longer let a repo suppress its own findings.
+- **`yara-python` is now a required dependency**, not optional. Without the signature engine, scans record a coverage gap and grade `INCOMPLETE` unless `--no-yara` is passed explicitly.
+- **Exit codes:** `INCOMPLETE` and unaccepted `SCOPED` scans exit 1; failed/invalid `--diff` and missing/malformed/wrong-schema `--baseline` exit 2 (pre-scan refusal, never a silent full scan).
+
+### Added
+- First-class coverage ledger (`report.coverage_gaps`) plus `incomplete`, `scoped`, `scoped_grade`, `incomplete_reasons`, `scope_reasons`, and `trust_target` fields on the report and in JSON output.
+- Per-ecosystem dependency `audit_status` (`clean`/`vulnerable`/`unavailable`/`timed_out`/`unparseable`/`error`/`no_lockfile`/`unsupported`/`unaudited`/`partial`). Every ecosystem (Python, JavaScript, Go, Rust) is audited independently; `clean` is only reachable after a completed, schema-validated auditor run.
+- OSV.dev coverage accounting: pinned-only queries, the 400-package cap, and short batch responses now mark the ecosystem `partial` (fail closed) rather than clean.
+- Parse-failure fail-closed for the AST scanner and taint analyzer; analyzer crashes and import failures are recorded, not swallowed.
+- YARA runtime fail-closed: engine match errors, unreadable targets, and 2 MB truncation each record a distinct coverage gap.
+- `--accept-scoped` flag for CI acceptance of intentionally narrowed scans.
+
+### Fixed
+- Dependency audit no longer fails open: missing auditors, timeouts, malformed/wrong-shape auditor JSON, npm error-JSON, and lockfile-less manifests previously read as "no vulnerabilities" now fail closed with distinct states.
+- Multi-ecosystem repositories no longer drop an ecosystem because a single `package_manager` value was overwritten.
+- Ecosystem audit states no longer cross-contaminate through the shared findings list (per-ecosystem finding deltas).
+- OSV 400-package cap and short batch responses now mark the ecosystem `partial` via coverage metadata (requested/queried/responded), never clean.
+- pip-audit reads only `requirements.txt`; a dependency declared solely in `pyproject.toml` now makes the Python ecosystem `partial` even on a successful audit.
+- Nested auditor-output schema validation: pip `vulns` must be a list of objects, npm `vulnerabilities` must be an object (a list or error-JSON is rejected), cargo `vulnerabilities.list` must be a list, and a single malformed govulncheck JSON line marks the Go audit `unparseable` rather than being skipped.
+- Tool-specific acceptable return codes enforced (pip-audit/npm/cargo 0 or 1, govulncheck 0 or 3); valid-looking JSON from an unexplained exit code is no longer read as clean.
+- Malformed `pyproject.toml` (real `tomllib` parse failure) and malformed `package-lock.json` now produce `unparseable` audit gaps instead of being silently rescued by the regex fallback or masked as `unavailable`.
+
+### Known gaps (tracked for P1+)
+- Grade-integrity heuristics (five-file frequency downgrade, path-class downgrades, B-floor, per-file cap) are still live — P1.
+- README/SKILL.md still advertise MCP tool-shadowing / rug-pull / namespace-collision detection with no implementation — P2 (implement-or-strip).
+- Detector breadth (taint kwargs, hostname C2, `importlib`, OSV CVSS vector parsing) — P3.
+- No end-to-end CLI validation against live targets has been run yet.
+
 ## [1.4.1] - 2026-07-10
 
-Bugfix release: `hooks/` findings are no longer silently downgraded. A `hooks/` directory holds install- and invocation-time executable code (Claude Code event hooks, git hooks, package lifecycle), but it was bucketed with `references/` as documentation, so a CRITICAL or HIGH finding inside `hooks/` was reclassified to LOW and dropped out of the CRITICAL score ceiling. The scanner was muting exactly the install-time execution surface it exists to flag. This release also fixes a stale `--help` version banner. Test suite grew from 342 to 346, all passing; self-scan stays grade A.
+Bugfix release: `hooks/` findings are no longer silently downgraded. A `hooks/` directory holds install- and invocation-time executable code (Claude Code event hooks, git hooks, package lifecycle), but it was bucketed with `references/` as documentation, so a CRITICAL or HIGH finding inside `hooks/` was reclassified to LOW and dropped out of the CRITICAL score ceiling. The scanner was muting exactly the install-time execution surface it exists to flag. Test suite grew from 342 to 345, all passing; self-scan stays grade A.
 
 ### Fixed
 - **`hooks/` findings were downgraded like reference docs.** `hooks` was a member of the reference/doc classification set (`is_reference`), so CRITICAL/HIGH findings in a `hooks/` directory were downgraded to LOW and excluded from the undowngraded-CRITICAL score ceiling, silencing real install-time execution risk. `hooks` is removed from that set. A bare `hooks/` path is now neutral: detector severity stands, with no downgrade and no path-based uplift (path alone is not evidence of intent). `references/` behavior is unchanged.
-- **`--help` banner showed a stale version.** The argparse description and module docstring hardcoded `v1.3.0`, so `--help` disagreed with `--version` and the package metadata. The banner now derives from the `VERSION` constant and the docstring drops the hardcoded number; a new test asserts `--help` carries the current version so it cannot drift again.
 
 ## [1.4.0] - 2026-07-03
 

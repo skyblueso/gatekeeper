@@ -34,12 +34,13 @@ class ReportPrinter:
             self.GRADE_COLORS = {
                 "A": "\033[92m", "B": "\033[93m",
                 "C": "\033[38;5;208m", "D": "\033[38;5;208m", "F": "\033[91m",
+                "INCOMPLETE": "\033[38;5;208m",
             }
         else:
             self.RESET = self.BOLD = self.DIM = ""
             self.RED = self.GREEN = self.YELLOW = self.ORANGE = self.BLUE = self.CYAN = ""
             self.SEVERITY_COLORS = {k: "" for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
-            self.GRADE_COLORS = {k: "" for k in ("A", "B", "C", "D", "F")}
+            self.GRADE_COLORS = {k: "" for k in ("A", "B", "C", "D", "F", "INCOMPLETE")}
 
     SEVERITY_ICONS = {
         "CRITICAL": "!!!",  "HIGH": " !! ",
@@ -51,6 +52,7 @@ class ReportPrinter:
         "C": "CAUTION",
         "D": "DANGER",
         "F": "FAIL",
+        "INCOMPLETE": "NO VERDICT",
     }
 
     def print_banner(self):
@@ -208,6 +210,9 @@ class ReportPrinter:
         grade = report.grade
         color = self.GRADE_COLORS.get(grade, self.RED)
         label = self.GRADE_LABELS.get(grade, "")
+        if report.scoped:
+            # Never print SAFE/LOW RISK etc. as if the letter covered the whole target.
+            label = "SCOPED — diagnostic for the scanned surface only"
         # Visual bar: A=20 filled, B=16, C=12, D=6, F=2
         fill_map = {"A": 20, "B": 16, "C": 12, "D": 6, "F": 2}
         filled = fill_map.get(grade, 2)
@@ -262,7 +267,20 @@ class ReportPrinter:
         grade = report.grade
         is_malicious = self._has_malicious_intent(report.findings)
         print()
-        if grade in ("A", "B"):
+        if grade == "INCOMPLETE":
+            print(f"  {self.ORANGE}{self.BOLD}INCOMPLETE — NO INSTALL VERDICT{self.RESET}")
+            print(f"  {self.DIM}Content escaped scanning; the letter grade is withheld.{self.RESET}")
+            for reason in report.incomplete_reasons:
+                print(f"  {self.ORANGE}[!]{self.RESET} {reason}")
+            if report.scoped_grade:
+                print(f"  {self.DIM}Scanned portion scored {report.scoped_grade} — diagnostic only, not a verdict.{self.RESET}")
+        elif report.scoped:
+            print(f"  {self.ORANGE}{self.BOLD}SCOPED {grade} — NOT A WHOLE-TARGET VERDICT{self.RESET}")
+            for reason in report.scope_reasons:
+                print(f"  {self.ORANGE}[!]{self.RESET} {reason}")
+            print(f"  {self.DIM}The letter applies only to the scanned surface. Re-run without "
+                  f"opt-outs for a whole-target verdict.{self.RESET}")
+        elif grade in ("A", "B"):
             print(f"  {self.GREEN}{self.BOLD}LOW RISK{self.RESET}")
             print(f"  {self.DIM}Minimal patterns detected. Context analysis likely to confirm safe.{self.RESET}")
         elif grade == "C":
