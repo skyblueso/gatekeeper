@@ -74,15 +74,20 @@ def audit_packages(packages, ecosystem, timeout=15):
     packages: list of {"name": str, "version": str}
     ecosystem: OSV ecosystem string ("PyPI", "npm", "Go", "crates.io")
 
-    Returns (results, warning):
+    Returns (results, warning, coverage):
       results: list of dicts {package, version, id, cve, summary, severity}
       warning: None on success, else a short string explaining what failed.
-    Network/parse failures yield ([], warning), never an exception.
+      coverage: {"requested": R, "queried": Q, "responded": S} so the caller can
+                fail closed when the 400-package cap truncated the query set
+                (Q < R) or OSV returned a short batch (S < Q).
+    Network/parse failures yield ([], warning, coverage), never an exception.
     """
     pinned = [p for p in packages if p.get("name") and p.get("version")]
+    requested = len(pinned)
     if not pinned:
-        return [], None
+        return [], None, {"requested": 0, "queried": 0, "responded": 0}
     pinned = pinned[:MAX_QUERIES]
+    coverage = {"requested": requested, "queried": len(pinned), "responded": 0}
 
     batch_payload = {
         "queries": [
@@ -94,13 +99,14 @@ def audit_packages(packages, ecosystem, timeout=15):
     try:
         batch = _post_json(OSV_BATCH_URL, batch_payload, timeout)
     except urllib.error.URLError as e:
-        return [], f"OSV.dev lookup skipped: network error ({getattr(e, 'reason', e)})"
+        return [], f"OSV.dev lookup skipped: network error ({getattr(e, 'reason', e)})", coverage
     except (TimeoutError, OSError) as e:
-        return [], f"OSV.dev lookup skipped: connection failed ({e})"
+        return [], f"OSV.dev lookup skipped: connection failed ({e})", coverage
     except (json.JSONDecodeError, ValueError):
-        return [], "OSV.dev lookup skipped: unexpected response"
+        return [], "OSV.dev lookup skipped: unexpected response", coverage
 
     osv_results = batch.get("results", []) if isinstance(batch, dict) else []
+    coverage["responded"] = len(osv_results)
     results = []
     detail_cache = {}
     fetches = 0
@@ -134,4 +140,4 @@ def audit_packages(packages, ecosystem, timeout=15):
                 "severity": _cvss_to_severity(detail),
             })
 
-    return results, None
+    return results, None, coverage

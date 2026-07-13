@@ -203,6 +203,19 @@ class ScanReport:
     grade: str = ""
     recommendation: str = ""
     verdict: str = ""
+    # Fail-closed accounting: when scannable content escaped analysis, the letter
+    # grade is withheld. incomplete=True, grade becomes "INCOMPLETE", and the letter
+    # the scanned portion earned is kept in scoped_grade as a diagnostic only.
+    incomplete: bool = False
+    scoped_grade: str = ""
+    incomplete_reasons: List[str] = field(default_factory=list)
+    # Scoped: the operator explicitly narrowed the scan (--skip-deps, --no-yara,
+    # --exclude, --diff, --baseline, --disable-rules, suppressions). The letter
+    # grade survives as a diagnostic for the scanned surface, but the verdict
+    # names the narrowing and is never a bare whole-target INSTALL.
+    scoped: bool = False
+    scope_reasons: List[str] = field(default_factory=list)
+    trust_target: bool = False
     mcp_scan_available: bool = False
     verified_count: int = 0
     dismissed_count: int = 0
@@ -228,6 +241,12 @@ class ScanReport:
             "score": self.score, "grade": self.grade,
             "recommendation": self.recommendation,
             "verdict": self.verdict,
+            "incomplete": self.incomplete,
+            "scoped_grade": self.scoped_grade,
+            "incomplete_reasons": self.incomplete_reasons,
+            "scoped": self.scoped,
+            "scope_reasons": self.scope_reasons,
+            "trust_target": self.trust_target,
             "mcp_scan_available": self.mcp_scan_available,
             "verified_count": self.verified_count,
             "dismissed_count": self.dismissed_count,

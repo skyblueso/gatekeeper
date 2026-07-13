@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gatekeeper-scanner"
-version = "1.4.1"
+version = "2.0.0.dev0"
 description = "Security scanner for GitHub repos, MCP servers, AI agent packages, and local projects"
 requires-python = ">=3.9"
 license = "MIT"
@@ -23,6 +23,14 @@ classifiers = [
     "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
 ]
+dependencies = [
+    # Signature engine is part of the default product: without it every scan
+    # records a coverage gap and grades INCOMPLETE (unless --no-yara).
+    "yara-python",
+    # Real TOML parser for pyproject.toml on Python 3.9/3.10 (stdlib tomllib is
+    # 3.11+). Without it, malformed TOML can't be detected as unparseable.
+    'tomli; python_version < "3.11"',
+]
 
 [project.urls]
 Homepage = "https://github.com/skyblueso/gatekeeper"
@@ -34,9 +42,10 @@ Changelog = "https://github.com/skyblueso/gatekeeper/blob/main/CHANGELOG.md"
 gatekeeper = "gatekeeper_scanner.core:main"
 
 [project.optional-dependencies]
-dev = ["pip-audit"]
-# Optional engine: enables YARA signature scanning (webshells, miners,
-# reverse shells, droppers). Gatekeeper runs fully without it.
+dev = ["pip-audit", "yara-python"]
+# YARA signature engine (webshells, miners, reverse shells, droppers).
+# Without it, scans record a coverage gap and grade INCOMPLETE unless the
+# operator explicitly passes --no-yara.
 yara = ["yara-python"]
 all = ["pip-audit", "yara-python"]
 

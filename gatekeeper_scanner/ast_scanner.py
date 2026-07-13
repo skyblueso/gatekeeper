@@ -23,7 +23,7 @@ class ASTScanner:
     """
 
     def scan_file(self, fpath: str, rel_path: str, content: str,
-                  trust_target: bool = False) -> List[Finding]:
+                  trust_target: bool = False, on_parse_failure=None) -> List[Finding]:
         """Scan a Python file using AST analysis.
 
         Args:
@@ -31,14 +31,19 @@ class ASTScanner:
             rel_path: Relative path (used in Finding.file).
             content: File content (pre-loaded from scanner's cache).
             trust_target: If True, honor inline # gatekeeper: ignore comments.
+            on_parse_failure: Optional callable invoked with the exception when
+                the file cannot be parsed, so the caller can record the lost
+                coverage instead of failing open.
 
         Returns:
             List of Finding objects. Empty list if parsing fails.
         """
         try:
             tree = ast.parse(content, filename=fpath)
-        except (SyntaxError, ValueError, RecursionError):
-            return []  # Fall back to regex for this file
+        except (SyntaxError, ValueError, RecursionError) as e:
+            if on_parse_failure is not None:
+                on_parse_failure(e)
+            return []  # Regex still covers this file; the gap is the caller's to record
 
         visitor = _SecurityVisitor(rel_path, content.split("\n"), trust_target)
         visitor.visit(tree)

@@ -19,7 +19,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        # yara-python is a required dependency: without the signature engine
+        # every scan records a coverage gap and grades INCOMPLETE. CI must
+        # install it so the graded-scan tests exercise the real default.
+        run: python -m pip install --upgrade pip yara-python "tomli; python_version < '3.11'"
       - name: Run tests
         run: python -m unittest test_gatekeeper -v
       - name: Self-scan
-        run: python gatekeeper.py --self-scan --no-color
+        # Gatekeeper's own pyproject-declared dependencies have no CVE auditor
+        # input path yet (P4), so a whole-target self-scan is legitimately
+        # SCOPED. --accept-scoped acknowledges that; --skip-deps keeps CI off
+        # the network.
+        run: python gatekeeper.py --self-scan --no-color --skip-deps --accept-scoped

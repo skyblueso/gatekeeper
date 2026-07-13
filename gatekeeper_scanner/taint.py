@@ -298,12 +298,16 @@ def _analyze_scope(rel, body, seed_params=None):
     return scope.findings
 
 
-def analyze(rel_path, source_code):
+def analyze(rel_path, source_code, on_parse_failure=None):
     """Parse Python source and return a list of taint findings:
-    [{line, severity, cwe, message}]. Returns [] on syntax error."""
+    [{line, severity, cwe, message}]. Returns [] on syntax error; if
+    on_parse_failure is given it is invoked with the exception so the caller
+    can record the lost coverage instead of failing open."""
     try:
         tree = ast.parse(source_code)
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError) as e:
+        if on_parse_failure is not None:
+            on_parse_failure(e)
         return []
 
     findings = []
