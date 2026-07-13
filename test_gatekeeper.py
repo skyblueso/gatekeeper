@@ -3890,6 +3890,7 @@ class TestYaraRuntimeFailClosed(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
     @unittest.skipUnless(yara_mod.available(), "yara-python not installed")
+    @unittest.skipIf(os.name == "nt", "chmod-000 does not block reads on Windows; see mocked variant")
     def test_unreadable_target_voids_grade(self):
         """Platform integration lane: a real chmod-000 file. May behave
         differently under root/Windows; the deterministic regression is the

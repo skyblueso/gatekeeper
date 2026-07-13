@@ -23,7 +23,7 @@ jobs:
         # yara-python is a required dependency: without the signature engine
         # every scan records a coverage gap and grades INCOMPLETE. CI must
         # install it so the graded-scan tests exercise the real default.
-        run: python -m pip install --upgrade pip yara-python
+        run: python -m pip install --upgrade pip yara-python "tomli; python_version < '3.11'"
       - name: Run tests
         run: python -m unittest test_gatekeeper -v
       - name: Self-scan
